@@ -1128,6 +1128,51 @@ def _read_discord_prompt_timeout() -> int:
     return seconds
 
 
+class _StreamingTTSSink(discord.AudioSource):
+    """Dedicated AudioSource fed incrementally by streaming-TTS writes.
+
+    Used when no continuous VoiceMixer is installed.  ``read`` runs on
+    discord.py's sender thread every 20 ms; writes arrive from the asyncio
+    loop thread.  Underruns emit silence so the stream survives slow TTS;
+    after ``end()`` + drain the caller stops the VC (transmit dot off).
+    """
+
+    def __init__(self) -> None:
+        try:
+            from voice_mixer import SILENCE_FRAME, StreamingSpeechChild
+        except ImportError:
+            from .voice_mixer import SILENCE_FRAME, StreamingSpeechChild
+        self._child = StreamingSpeechChild(name="tts_sink")
+        self._silence = SILENCE_FRAME
+        self._np = None  # cached numpy module (lazy)
+
+    def is_opus(self) -> bool:
+        return False
+
+    def write(self, pcm48k_stereo: bytes) -> None:
+        self._child.write(pcm48k_stereo)
+
+    def end(self) -> None:
+        self._child.end()
+
+    def abort(self) -> None:
+        self._child.abort()
+
+    @property
+    def drained(self) -> bool:
+        return self._child.finished
+
+    def read(self) -> bytes:
+        frame = self._child.read_frame()
+        if frame is None:
+            return self._silence
+        if self._np is None:
+            import numpy as np_mod
+            self._np = np_mod
+        np.clip(frame, -32768, 32767, out=frame)
+        return frame.astype(self._np.int16).tobytes()
+
+
 class DiscordAdapter(BasePlatformAdapter):
     """
     Discord bot adapter.
@@ -1210,6 +1255,10 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_mixers: Dict[int, Any] = {}  # guild_id -> VoiceMixer
         self._ambient_pcm_cache: Optional[bytes] = None  # decoded ambient bed
         self._voice_fx_cfg: Dict[str, Any] = self._load_voice_fx_config()
+        # Streaming TTS sessions (gateway #60671): id(handle) -> session dict,
+        # plus guild_id -> handle-id index for O(1) barge-in lookup.
+        self._streaming_tts_sessions: Dict[int, Dict[str, Any]] = {}
+        self._streaming_tts_by_guild: Dict[int, int] = {}
         # Track threads where the bot has participated so follow-up messages
         # in those threads don't require @mention.  Persisted to disk so the
         # set survives gateway restarts.
@@ -4726,6 +4775,8 @@ class DiscordAdapter(BasePlatformAdapter):
             # Tear down the mixer (stops the continuous outgoing stream).
             if getattr(self, "_voice_mixers", None) is not None:
                 self._voice_mixers.pop(guild_id, None)
+            # Drop any active streaming-TTS session for this guild.
+            self._abort_streaming_session_for_guild(guild_id)
 
             vc = self._voice_clients.pop(guild_id, None)
             if vc and vc.is_connected():
@@ -4741,9 +4792,190 @@ class DiscordAdapter(BasePlatformAdapter):
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
 
+    # ------------------------------------------------------------------
+    # Streaming TTS adapter contract (gateway #60671)
+    # ------------------------------------------------------------------
+    # Accepts PCM chunks from the gateway's StreamingTTSConsumer while the
+    # LLM is still generating, so the first sentence plays as soon as it is
+    # synthesised instead of after the whole response.  Two playback modes:
+    #   * mixer mode  — VoiceMixer installed: feed an incremental speech
+    #                   stream child (ambient bed keeps playing underneath).
+    #   * direct mode — no mixer: play a dedicated AudioSource on the VC.
+    # The receiver is NOT paused during playback (mirrors the mixer path) so
+    # barge-in keeps working mid-reply.
+
+    def _guild_for_streaming_chat(self, chat_id: str) -> Optional[int]:
+        """Resolve a text chat_id to a voice-connected guild, or None."""
+        gid: Optional[int] = None
+        try:
+            channel = self._client.get_channel(int(chat_id)) if self._client else None
+        except (TypeError, ValueError):
+            channel = None
+        guild = getattr(channel, "guild", None)
+        if guild is not None:
+            gid = guild.id
+        if gid is None:
+            for cand_gid, tcid in getattr(self, "_voice_text_channels", {}).items():
+                if str(tcid) == str(chat_id):
+                    gid = cand_gid
+                    break
+        return gid
+
+    def supports_streaming_tts(self, chat_id: str, audio_format: Any) -> bool:
+        # We convert 24 kHz mono s16le (the OpenAI-compatible streamer format)
+        # to Discord-native 48 kHz stereo ourselves; anything else declines so
+        # the gateway falls back to whole-file TTS.
+        if (
+            int(getattr(audio_format, "sample_rate", 0)) != 24000
+            or int(getattr(audio_format, "channels", 0)) != 1
+            or int(getattr(audio_format, "sample_width", 0)) != 2
+        ):
+            return False
+        gid = self._guild_for_streaming_chat(chat_id)
+        if gid is None:
+            return False
+        vc = self._voice_clients.get(gid)
+        return bool(vc and vc.is_connected())
+
+    async def begin_streaming_tts(
+        self,
+        chat_id: str,
+        audio_format: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Optional[Any]:
+        from gateway.platforms.base import StreamingTTSHandle
+
+        gid = self._guild_for_streaming_chat(chat_id)
+        vc = self._voice_clients.get(gid) if gid is not None else None
+        if not vc or not vc.is_connected():
+            return None
+        # One streaming session per guild: abort any stale one first.
+        self._abort_streaming_session_for_guild(gid)
+
+        handle = StreamingTTSHandle(chat_id=str(chat_id), audio_format=audio_format)
+
+        mixer = self._voice_mixers.get(gid)
+        session: Dict[str, Any]
+        if mixer is not None:
+            child = mixer.open_speech_stream(
+                gain=float(self._voice_fx_cfg.get("speech_gain", 1.0)),
+            )
+            session = {"mode": "mixer", "child": child}
+        else:
+            sink = _StreamingTTSSink()
+
+            def _after(error: Optional[Exception]) -> None:
+                if error:
+                    logger.error("Streaming TTS sink error (guild=%s): %s", gid, error)
+
+            try:
+                if vc.is_playing():
+                    vc.stop()
+                vc.play(sink, after=_after)
+            except Exception as exc:
+                logger.warning("Could not start streaming TTS sink (guild=%s): %s", gid, exc)
+                return None
+            session = {"mode": "direct", "sink": sink}
+
+        session["guild_id"] = gid
+        session["vc"] = vc
+        session["handle"] = handle
+        self._cancel_voice_timeout(gid)  # speaking counts as activity
+        self._streaming_tts_sessions[id(handle)] = session
+        self._streaming_tts_by_guild[gid] = id(handle)
+        logger.info("Streaming TTS started (guild=%s, mode=%s)", gid, session["mode"])
+        return handle
+
+    async def write_streaming_tts(self, handle: Any, chunk: bytes) -> None:
+        session = self._streaming_tts_sessions.get(id(handle))
+        if session is None or handle.aborted or not chunk:
+            return
+        try:
+            from voice_mixer import pcm_24k_mono_to_48k_stereo
+        except ImportError:
+            from .voice_mixer import pcm_24k_mono_to_48k_stereo
+        pcm = await asyncio.to_thread(pcm_24k_mono_to_48k_stereo, chunk)
+        if handle.aborted:
+            return
+        if session["mode"] == "mixer":
+            session["child"].write(pcm)
+        else:
+            session["sink"].write(pcm)
+        handle.audible = True
+
+    async def finish_streaming_tts(self, handle: Any, *, interrupted: bool = False) -> None:
+        session = self._streaming_tts_sessions.pop(id(handle), None)
+        if session is None:
+            return
+        self._streaming_tts_by_guild.pop(session["guild_id"], None)
+        gid = session["guild_id"]
+        try:
+            if interrupted:
+                self._teardown_streaming_session(session)
+                return
+            deadline = time.monotonic() + 120.0
+            if session["mode"] == "mixer":
+                session["child"].end()
+                while not session["child"].finished and time.monotonic() < deadline:
+                    await asyncio.sleep(0.05)
+            else:
+                session["sink"].end()
+                while not session["sink"].drained and time.monotonic() < deadline:
+                    await asyncio.sleep(0.05)
+                vc = session["vc"]
+                try:
+                    if vc.is_connected():
+                        vc.stop()  # stop transmitting (green dot off)
+                except Exception:
+                    pass
+        finally:
+            self._reset_voice_timeout(gid)
+        logger.info("Streaming TTS finished (guild=%s, mode=%s)", gid, session["mode"])
+
+    async def abort_streaming_tts(self, handle: Any, error: Optional[str] = None) -> None:
+        session = self._streaming_tts_sessions.pop(id(handle), None)
+        if session is None:
+            return
+        self._streaming_tts_by_guild.pop(session["guild_id"], None)
+        self._teardown_streaming_session(session)
+
+    def _teardown_streaming_session(self, session: Dict[str, Any]) -> None:
+        """Stop playback immediately and restore post-turn state."""
+        gid = session.get("guild_id")
+        try:
+            if session["mode"] == "mixer":
+                session["child"].abort()
+            else:
+                session["sink"].abort()
+                vc = session.get("vc")
+                if vc is not None and vc.is_connected():
+                    vc.stop()
+        except Exception:
+            logger.debug("streaming TTS teardown error", exc_info=True)
+        finally:
+            if gid is not None:
+                self._reset_voice_timeout(gid)
+
+    def _abort_streaming_session_for_guild(self, guild_id: int) -> bool:
+        """Abort any active streaming-TTS session in *guild_id* (barge-in)."""
+        hid = self._streaming_tts_by_guild.pop(guild_id, None)
+        if hid is None:
+            return False
+        session = self._streaming_tts_sessions.pop(hid, None)
+        if session is None:
+            return False
+        handle = session.get("handle")
+        if handle is not None:
+            handle.aborted = True
+        self._teardown_streaming_session(session)
+        return True
+
     def stop_voice_playback(self, guild_id: int) -> bool:
         """Stop any active voice playback (mixer speech or legacy player) in a guild."""
         stopped = False
+        # Streaming-TTS session active? Abort it first (barge-in).
+        if self._abort_streaming_session_for_guild(guild_id):
+            stopped = True
         mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
         if mixer is not None:
             # Mixer path: only drop in-flight speech.  NEVER call vc.stop() —
