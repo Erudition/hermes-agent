@@ -818,7 +818,12 @@ class VoiceReceiver:
                         if self._packet_debug_count <= 10:
                             logger.warning("DAVE decrypt failed for ssrc=%d: %s", ssrc, e)
                         return
-            # If SSRC unknown (no SPEAKING event yet), skip DAVE and try
+            elif dave_proto > 0:
+                # In DAVE v1+, ALL audio must be encrypted. If we do not know
+                # the SSRC, we MUST drop it rather than feed DAVE-encrypted
+                # ciphertext into Opus, which produces ear-destroying garbage.
+                return
+            # If SSRC unknown (no SPEAKING event yet) and no DAVE negotiated, skip DAVE and try
             # Opus decode directly — audio may be in passthrough mode.
             # Buffer will get a user_id when SPEAKING event arrives later.
 
