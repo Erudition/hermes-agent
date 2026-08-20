@@ -854,6 +854,10 @@ class ModelCapabilities:
     context_window: int = 200000
     max_output_tokens: int = 8192
     model_family: str = ""
+    input_modalities: Tuple[str, ...] = ()  # ("text", "image", "pdf", "audio", ...)
+
+    def supports_audio_input(self) -> bool:
+        return "audio" in self.input_modalities
 
 
 # --------------------------------------------------------------------------- #
@@ -1206,9 +1210,9 @@ def get_model_capabilities(
         # Vision: prefer explicit `modalities.input` when models.dev provides it.
         # The older `attachment` flag can be stale or too broad for image routing;
         # fall back to it only when the input modalities are absent/invalid.
-        input_mods = entry.get("modalities", {})
-        if isinstance(input_mods, dict):
-            input_mods = input_mods.get("input")
+        input_mods_raw = entry.get("modalities", {})
+        if isinstance(input_mods_raw, dict):
+            input_mods = input_mods_raw.get("input")
         else:
             input_mods = None
         if isinstance(input_mods, list):
@@ -1216,6 +1220,8 @@ def get_model_capabilities(
         else:
             supports_vision = bool(entry.get("attachment", False))
         supports_reasoning = bool(entry.get("reasoning", False))
+        # Extract audio support from modalities.input
+        _input_modalities = tuple(input_mods) if isinstance(input_mods, list) else ()
 
         limit = entry.get("limit", {})
         if not isinstance(limit, dict):
@@ -1238,6 +1244,7 @@ def get_model_capabilities(
         context_window = 200000
         max_output_tokens = 8192
         model_family = ""
+        _input_modalities = ()
 
     # Apply override patches (each field is optional in the override dict).
     if override is not None:
@@ -1255,6 +1262,9 @@ def get_model_capabilities(
             max_output_tokens = out_ov
         if "model_family" in override:
             model_family = str(override["model_family"] or "")
+        if "supports_audio_input" in override:
+            _audio_flag = bool(override["supports_audio_input"])
+            _input_modalities = ("text", "audio") if _audio_flag else ()
 
     return ModelCapabilities(
         supports_tools=supports_tools,
@@ -1263,6 +1273,7 @@ def get_model_capabilities(
         context_window=context_window,
         max_output_tokens=max_output_tokens,
         model_family=model_family,
+        input_modalities=_input_modalities,
     )
 
 

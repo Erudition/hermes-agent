@@ -6220,6 +6220,36 @@ class TurnRunner:
             else:
                 _run_message = ctx.message
 
+            # --- Native audio attachment (audio-capable models, e.g. Gemini) ---
+            _native_audios = self._runner._consume_pending_native_audio_paths(ctx.session_key)
+            if _native_audios:
+                try:
+                    from agent.image_routing import build_native_audio_parts
+                    _audio_parts, _audio_skipped = build_native_audio_parts(
+                        ctx.message, _native_audios,
+                    )
+                    if _audio_skipped:
+                        logger.info(
+                            "Native audio: skipped %d file(s) (read errors or missing).",
+                            _audio_skipped,
+                        )
+                    if any(p.get("type") == "audio_url" for p in _audio_parts):
+                        if isinstance(_run_message, list):
+                            # Merge with existing native image parts
+                            _run_message = _run_message + _audio_parts
+                        else:
+                            # Text message — prepend audio parts with a text preamble
+                            _run_message = [
+                                {"type": "text", "text": _run_message or ""},
+                            ] + _audio_parts
+                except Exception as _aud_exc:
+                    logger.warning(
+                        "Native audio attachment failed, falling back to text: %s",
+                        _aud_exc,
+                    )
+                    # NOTE: Cannot call async STT here (run_sync is sync).
+                    # The voice data is lost on failure; the user can resend.
+
             _api_run_message = _wrap_current_message_with_observed_context(
                 _run_message,
                 observed_group_context,
@@ -6577,6 +6607,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     _pending_messages = legacy_dict_property("_pending_messages")
     _pending_native_image_paths_by_session = legacy_dict_property(
         "_pending_native_image_paths_by_session"
+    )
+    _pending_native_audio_paths_by_session = legacy_dict_property(
+        "_pending_native_audio_paths_by_session"
     )
     _session_ephemeral_pin = legacy_dict_property("_session_ephemeral_pin")
     _session_vc_last = legacy_dict_property("_session_vc_last")
@@ -10202,6 +10235,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 elif not _interrupt_text and _media_urls:
                     _interrupt_text = _build_media_placeholder(event)
                 running_agent.interrupt(_interrupt_text)
+                # Signal adapter interrupt event so monitor_for_interrupt and streaming TTS abort
+                if adapter and hasattr(adapter, "_active_sessions"):
+                    _ev = adapter._active_sessions.get(session_key)
+                    if _ev is not None:
+                        _ev.set()
             except Exception:
                 pass  # don't let interrupt failure block the ack
 
@@ -17980,6 +18018,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             image_paths,
                         )
 
+            # --- Native audio routing (bypass STT for audio-capable models) ---
+            if audio_paths:
+                logger.warning(
+                    "Audio routing: %d voice file(s) detected, checking model audio support...",
+                    len(audio_paths),
+                )
+                _audio_native = await asyncio.to_thread(
+                    self._model_supports_audio_input,
+                    source=source,
+                    session_key=session_key,
+                )
+                if _audio_native:
+                    self._session_state(
+                        session_key
+                    ).persistent.native_audio_paths = list(audio_paths)
+                    logger.warning(
+                        "Audio routing: native (model supports audio input). "
+                        "%d voice file(s) will be attached inline, STT bypassed.",
+                        len(audio_paths),
+                    )
+                    audio_paths = []
+
             if audio_paths:
                 message_text, _successful_transcripts = await self._enrich_message_with_transcription(
                     message_text,
@@ -18284,6 +18344,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return []
         paths = list(state.persistent.native_image_paths)
         state.persistent.native_image_paths = []
+        return paths
+
+    def _consume_pending_native_audio_paths(self, session_key: str) -> List[str]:
+        """Consume and clear buffered native audio paths for this session."""
+        state = self._peek_session_state(session_key)
+        if state is None or not state.persistent.native_audio_paths:
+            return []
+        paths = list(state.persistent.native_audio_paths)
+        state.persistent.native_audio_paths = []
         return paths
 
     def _cache_session_source(self, session_key: str, source) -> None:
@@ -18732,6 +18801,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Read privacy.redact_pii from config (re-read per message)
         _redact_pii = False
         persist_user_message = None
+        if getattr(event, "message_type", None) == MessageType.AUDIO and event.media_urls:
+            persist_user_message = event.text or "[Audio attached]"
         persist_user_timestamp = None
         # Synthetic self-injected turns (async-delegation batch completions,
         # background watch notifications, resume wake-ups) arrive as
@@ -21627,9 +21698,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         return False
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str
+        self, guild_id: int, user_id: int, transcript: Optional[str] = None,
+        audio_path: Optional[str] = None, wav_path: Optional[str] = None
     ):
-        """Handle transcribed voice from a user in a voice channel.
+        """Handle transcribed voice or native audio from a user in a voice channel.
 
         Creates a synthetic MessageEvent and processes it through the
         adapter's full message pipeline (session, typing, agent, TTS reply).
@@ -21663,23 +21735,80 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
             return
 
-        if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
-            logger.info(
-                "Suppressing duplicate voice transcript for guild=%s user=%s: %s",
-                guild_id,
-                user_id,
-                transcript[:100],
-            )
-            return
+        use_native_audio = False
+        if audio_path and self._model_supports_audio_input(source=source):
+            use_native_audio = True
 
-        # Show transcript in text channel (after auth, with mention sanitization)
-        try:
-            channel = adapter._client.get_channel(text_ch_id)
-            if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
-        except Exception:
-            pass
+        if use_native_audio:
+            # Native audio path
+            sent_msg = None
+            try:
+                channel = adapter._client.get_channel(text_ch_id)
+                if channel and audio_path:
+                    import os
+                    import discord as _discord
+                    if os.path.isfile(audio_path):
+                        sent_msg = await channel.send(
+                            f"**[Voice]** <@{user_id}>: ⏳ transcribing...",
+                            file=_discord.File(audio_path, filename=os.path.basename(audio_path)),
+                        )
+                    else:
+                        sent_msg = await channel.send(f"**[Voice]** <@{user_id}>: ⏳ transcribing...")
+            except Exception:
+                pass
+
+            if sent_msg:
+                asyncio.create_task(self._voice_transcribe_and_edit(wav_path or audio_path, sent_msg, user_id))
+
+            text = "[Voice message]"
+            media_urls = [audio_path]
+            media_types = ["audio/ogg"]
+        else:
+            # Fallback STT path
+            _stt_path = wav_path or audio_path
+            if not transcript and _stt_path:
+                try:
+                    from tools.transcription_tools import transcribe_audio
+                    res = await asyncio.to_thread(transcribe_audio, _stt_path)
+                    if res and isinstance(res, dict) and res.get("success"):
+                        transcript = res.get("transcript", "").strip()
+                except Exception as exc:
+                    logger.warning("Fallback STT failed for %s: %s", _stt_path, exc)
+
+            if not transcript:
+                return
+
+            # Filter hallucinated / nonsensical STT output (same check the
+            # adapter used to perform before the native-audio refactor).
+            try:
+                from tools.voice_mode import is_whisper_hallucination
+                if is_whisper_hallucination(transcript):
+                    logger.info("Voice STT hallucination suppressed for user %d", user_id)
+                    return
+            except Exception:
+                pass
+
+            if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
+                logger.info(
+                    "Suppressing duplicate voice transcript for guild=%s user=%s: %s",
+                    guild_id,
+                    user_id,
+                    transcript[:100],
+                )
+                return
+
+            # Show transcript in text channel (after auth, with mention sanitization)
+            try:
+                channel = adapter._client.get_channel(text_ch_id)
+                if channel:
+                    safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+                    await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+            except Exception:
+                pass
+
+            text = transcript
+            media_urls = []
+            media_types = []
 
         # Build a synthetic MessageEvent and feed through the normal pipeline
         # Use SimpleNamespace as raw_message so _get_guild_id() can extract
@@ -21697,13 +21826,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt = None
         event = MessageEvent(
             source=source,
-            text=transcript,
+            text=text,
             message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
             channel_prompt=channel_prompt,
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
         await adapter.handle_message(event)
+
+    async def _voice_transcribe_and_edit(self, audio_path: str, message: Any, user_id: int):
+        """Asynchronously transcribe voice audio and edit placeholder message."""
+        try:
+            from tools.transcription_tools import transcribe_audio
+            from tools.voice_mode import is_whisper_hallucination
+
+            res = await asyncio.to_thread(transcribe_audio, audio_path)
+            if res and isinstance(res, dict) and res.get("success"):
+                raw_text = res.get("transcript", "").strip()
+                if is_whisper_hallucination(raw_text):
+                    text_to_display = "(transcription failed)"
+                else:
+                    safe_text = raw_text[:2000].replace("@everyone", "@\u200beveryone").replace("@here", "@\u200bhere")
+                    text_to_display = safe_text
+            else:
+                text_to_display = "(transcription failed)"
+
+            await message.edit(content=f"**[Voice]** <@{user_id}>: {text_to_display}")
+        except Exception as exc:
+            logger.warning("Voice transcribe and edit failed for user %s: %s", user_id, exc)
 
     def _should_send_voice_reply(
         self,
@@ -24221,6 +24373,64 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception as exc:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
+
+    def _model_supports_audio_input(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> bool:
+        """Return True if the resolved model for this turn supports native audio input."""
+        try:
+            from agent.models_dev import get_model_capabilities
+            from agent.image_routing import _supports_audio_input_override
+            from agent.auxiliary_client import _read_main_model, _read_main_provider
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            resolved_provider = (provider or "").strip() if provider else ""
+            resolved_model = (model or "").strip() if model else ""
+
+            # Resolve session runtime (same pattern as _decide_image_input_mode)
+            needs_session_runtime = not resolved_provider or not resolved_model
+            has_session_identity = source is not None or session_key
+            if needs_session_runtime and has_session_identity:
+                try:
+                    turn_model, runtime_kwargs = self._resolve_session_agent_runtime(
+                        source=source,
+                        session_key=session_key,
+                        user_config=cfg,
+                    )
+                    if not resolved_model and isinstance(turn_model, str):
+                        resolved_model = turn_model.strip()
+                    runtime_provider = runtime_kwargs.get("provider") if isinstance(runtime_kwargs, dict) else None
+                    if not resolved_provider and isinstance(runtime_provider, str):
+                        resolved_provider = runtime_provider.strip()
+                except Exception as exc:
+                    logger.debug(
+                        "audio_routing: session runtime resolution failed, falling back to config — %s",
+                        exc,
+                    )
+
+            if not resolved_provider:
+                resolved_provider = _read_main_provider()
+            if not resolved_model:
+                resolved_model = _read_main_model()
+
+            # Check config override first (like _lookup_supports_vision)
+            override = _supports_audio_input_override(
+                cfg, resolved_provider, resolved_model,
+            )
+            if override is not None:
+                return override
+
+            caps = get_model_capabilities(resolved_provider, resolved_model)
+            return caps.supports_audio_input() if caps else False
+        except Exception as exc:
+            logger.warning("audio_routing: capability check failed, falling back to STT — %s", exc)
+            return False
 
     async def _enrich_message_with_vision(
         self,
@@ -29620,6 +29830,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         cleanup_screenshot_cache,
         cleanup_video_cache,
     )
+    from tools.tool_result_storage import cleanup_spillover_cache
     from hermes_cli.debug import _sweep_expired_pastes
 
     IMAGE_CACHE_EVERY = 60   # ticks — once per hour at default 60s interval
@@ -29638,6 +29849,7 @@ def _start_gateway_housekeeping(stop_event: threading.Event, adapters=None, loop
         ("Audio", cleanup_audio_cache),
         ("Video", cleanup_video_cache),
         ("Screenshot", cleanup_screenshot_cache),
+        ("Spillover", cleanup_spillover_cache),
     )
 
     logger.info("Gateway housekeeping started (interval=%ds)", interval)

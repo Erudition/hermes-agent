@@ -268,6 +268,7 @@ export const zh: Translations = {
       'view.toggleReview': '切换审查面板',
       'view.toggleStatusbar': '切换状态栏',
       'view.showFiles': '显示文件浏览器',
+      'view.showBrowser': '打开浏览器',
       'view.showTerminal': '显示终端',
       'view.terminalSelection': '将终端选区发送到输入框',
       'view.terminalCopy': '复制终端选区',
@@ -1065,6 +1066,10 @@ export const zh: Translations = {
       failedLoad: 'API 密钥加载失败',
       empty: '此类别暂时没有配置项。'
     },
+    search: {
+      placeholder: '搜索所有设置...',
+      pill: '搜索'
+    },
     profileScope: {
       appliesTo: '应用于',
       editsProfile: profile => `此页面的更改将应用于“${profile}”配置文件。`
@@ -1602,8 +1607,10 @@ export const zh: Translations = {
     gatewayStopped: '消息网关已停止',
     hermesActiveSessions: (version, count) => `Hermes ${version} · 活跃会话 ${count}`,
     restartGateway: '重启网关',
+    openBrowser: '打开浏览器',
     gatewayRestartFailed: '网关重启失败。',
     updateHermes: '更新 Hermes',
+    reloadWindow: '重新载入窗口',
     actionRunning: '运行中',
     actionDone: '完成',
     actionFailed: '失败',
@@ -1959,6 +1966,9 @@ export const zh: Translations = {
     creating: '创建中…',
     createAction: '创建配置档案',
     renameTitle: '重命名配置档案',
+    displayNameTitle: '为智能体命名',
+    displayNameDesc: '设置一个在整个应用中显示的名称。内部配置档案 ID 仍为 "default"。',
+    displayNameLabel: '显示名称',
     renameDescPrefix: '重命名会更新配置档案目录以及 ',
     renameDescSuffix: ' 中的所有包装脚本。',
     newNameLabel: '新名称',
@@ -3037,6 +3047,8 @@ export const zh: Translations = {
     web: {
       appFailedToBoot: '预览应用启动失败',
       serverNotFound: '未找到服务器',
+      remoteLoopback:
+        '该地址指向运行代理的那台机器，而不是本机。浏览器面板在本地加载页面，因此远程开发服务器需要端口转发或可访问的主机名。',
       failedToLoad: '预览加载失败',
       tryAgain: '重试',
       restarting: 'Hermes 正在重启...',
@@ -3050,6 +3062,12 @@ export const zh: Translations = {
       showConsole: '显示预览控制台',
       hideDevTools: '隐藏预览 DevTools',
       openDevTools: '打开预览 DevTools',
+      goBack: '后退',
+      goForward: '前进',
+      reload: '重新加载页面',
+      address: '地址',
+      addressPlaceholder: '输入地址',
+      blankPageBody: '在上方输入地址开始浏览，或让 Hermes 打开一个页面。',
       finishedRestarting: message => `Hermes 已完成预览服务器重启${message ? `: ${message}` : ''}`,
       failedRestarting: message => `服务器重启失败：${message}`,
       unknownError: '未知错误',

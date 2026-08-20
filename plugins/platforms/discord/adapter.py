@@ -592,6 +592,7 @@ class VoiceReceiver:
 
         # Per-user audio buffers
         self._buffers: Dict[int, bytearray] = defaultdict(bytearray)
+        self._opus_buffers: Dict[int, list] = defaultdict(list)  # raw Opus frames per SSRC
         self._last_packet_time: Dict[int, float] = {}
 
         # Opus decoder per SSRC (each user needs own decoder state)
@@ -611,7 +612,10 @@ class VoiceReceiver:
         """Start listening for voice packets."""
         conn = self._vc._connection
         self._secret_key = bytes(conn.secret_key)
-        self._dave_session = conn.dave_session
+        # NOTE: dave_session is read fresh from conn on each packet.
+        # Caching it here is wrong because DAVE initializes asynchronously
+        # AFTER the voice connection is established, so conn.dave_session
+        # is usually None at this point.
         self._bot_ssrc = conn.ssrc
 
         self._install_speaking_hook(conn)
@@ -628,6 +632,7 @@ class VoiceReceiver:
             pass
         with self._lock:
             self._buffers.clear()
+            self._opus_buffers.clear()
             self._last_packet_time.clear()
             self._decoders.clear()
             self._ssrc_to_user.clear()
@@ -787,13 +792,24 @@ class VoiceReceiver:
                 return
 
         # --- DAVE E2EE decrypt ---
-        if self._dave_session:
+        # Read dave_session fresh from the connection on EVERY packet.
+        # DAVE initializes asynchronously after the voice WS handshake;
+        # caching at start() always captured None.
+        conn = self._vc._connection
+        dave_session = getattr(conn, "dave_session", None)
+        dave_proto = getattr(conn, "dave_protocol_version", 0)
+        if dave_proto > 0 and dave_session is None:
+            # DAVE is negotiated but the MLS session hasn't completed yet.
+            # The NaCl-decrypted payload is still DAVE-encrypted — feeding
+            # it to the Opus decoder produces garbage.  Drop the packet.
+            return
+        if dave_session:
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
             if user_id:
                 try:
                     import davey
-                    decrypted = self._dave_session.decrypt(
+                    decrypted = dave_session.decrypt(
                         user_id, davey.MediaType.audio, decrypted
                     )
                 except Exception as e:
@@ -823,6 +839,13 @@ class VoiceReceiver:
                 e,
             )
             return
+
+        # --- Collect raw Opus frame AFTER successful decode (for OGG mux) ---
+        # Skip Discord control packets (e.g. f8fffe keepalive) and frames
+        # too small to be real Opus audio — they corrupt the OGG container.
+        if len(decrypted) >= 10:
+            with self._lock:
+                self._opus_buffers[ssrc].append(decrypted)
 
     # ------------------------------------------------------------------
     # Silence detection
@@ -855,7 +878,7 @@ class VoiceReceiver:
         return 0
 
     def check_silence(self) -> list:
-        """Return list of (user_id, pcm_bytes) for completed utterances."""
+        """Return list of (user_id, pcm_bytes, opus_frames) for completed utterances."""
         now = time.monotonic()
         completed = []
 
@@ -877,18 +900,20 @@ class VoiceReceiver:
                         # Infer from allowed users in the voice channel.
                         user_id = self._infer_user_for_ssrc(ssrc)
                     if user_id:
-                        completed.append((user_id, bytes(buf)))
+                        opus_frames = list(self._opus_buffers.pop(ssrc, []))
+                        completed.append((user_id, bytes(buf), opus_frames))
                     self._buffers[ssrc] = bytearray()
                     self._last_packet_time.pop(ssrc, None)
                 elif silence_duration >= self.SILENCE_THRESHOLD * 2:
                     # Stale buffer with no valid user — discard
                     self._buffers.pop(ssrc, None)
+                    self._opus_buffers.pop(ssrc, None)
                     self._last_packet_time.pop(ssrc, None)
 
         return completed
 
     def flush_pending(self) -> list:
-        """Return buffered utterances that have not yet reached silence."""
+        """Return buffered utterances that have not yet reached silence. Returns list of (user_id, pcm_bytes, opus_frames)."""
         completed = []
 
         with self._lock:
@@ -901,8 +926,9 @@ class VoiceReceiver:
                     if not user_id:
                         user_id = self._infer_user_for_ssrc(ssrc)
                     if user_id:
-                        completed.append((user_id, bytes(buf)))
+                        completed.append((user_id, bytes(buf), list(self._opus_buffers.pop(ssrc, []))))
                 self._buffers.pop(ssrc, None)
+                self._opus_buffers.pop(ssrc, None)
                 self._last_packet_time.pop(ssrc, None)
 
         return completed
@@ -945,6 +971,79 @@ class VoiceReceiver:
             stderr=subprocess.PIPE,
             creationflags=windows_hide_flags(),
         )
+
+    @staticmethod
+    def opus_to_ogg(opus_frames: list, output_path: str,
+                    sample_rate: int = 48000, channels: int = 2) -> None:
+        """Mux raw Opus frames into an OGG container.
+
+        Gemini accepts ``audio/ogg`` (Opus).  This writes a minimal
+        OGG/Opus file with an OpusHead header, OpusTags page, and one
+        data page per frame — sufficient for the Google Generative AI API.
+        """
+        import struct
+
+        def _ogg_crc(data: bytes) -> int:
+            """OGG CRC-32 (polynomial 0x04C11DB7 reflected, init 0)."""
+            crc = 0
+            for byte in data:
+                crc ^= byte << 24
+                for _ in range(8):
+                    if crc & 0x80000000:
+                        crc = ((crc << 1) ^ 0x04C11DB7) & 0xFFFFFFFF
+                    else:
+                        crc = (crc << 1) & 0xFFFFFFFF
+            return crc
+
+        def _make_page(header_type: int, granule: int, serial: int,
+                       seq: int, payload: bytes) -> bytes:
+            # Split payload into segments (max 255 bytes each)
+            segs = []
+            p = payload
+            while len(p) > 255:
+                segs.append(p[:255])
+                p = p[255:]
+            segs.append(p)  # last segment (0-255 bytes)
+
+            seg_table = bytes([len(s) for s in segs])
+            seg_data = b''.join(segs)
+
+            header = struct.pack('<4sBBqIIIB',
+                                 b'OggS', 0, header_type,
+                                 granule, serial, seq, 0, len(segs))
+            crc = _ogg_crc(header + seg_table + seg_data)
+            header = struct.pack('<4sBBqIIIB',
+                                 b'OggS', 0, header_type,
+                                 granule, serial, seq, crc, len(segs))
+            return header + seg_table + seg_data
+
+        serial = 0x4F505553  # "OPUS"
+        granule = 0
+
+        # OpusHead page (beginning of stream)
+        # RFC 7845: version(1) + channels(1) + pre_skip(2) +
+        #   input_sample_rate(4) + output_gain(2) + channel_mapping_family(1)
+        opus_head = struct.pack('<8sBBHIhB',
+                                b'OpusHead', 1, channels,
+                                3840, sample_rate, 0, 0)
+        head_page = _make_page(0x02, 0, serial, 0, opus_head)
+
+        # OpusTags page
+        vendor = b'hermes-voice'
+        tags_body = struct.pack('<8sI', b'OpusTags', len(vendor)) + vendor
+        tags_body += struct.pack('<I', 0)  # zero user comments
+        tags_page = _make_page(0x00, 0, serial, 1, tags_body)
+
+        # Data pages — one per Opus frame
+        data_pages = []
+        for i, frame in enumerate(opus_frames):
+            granule += 960  # 20ms at 48kHz
+            data_pages.append(_make_page(0x00, granule, serial, i + 2, frame))
+
+        with open(output_path, 'wb') as f:
+            f.write(head_page)
+            f.write(tags_page)
+            f.write(b''.join(data_pages))
 
 
 def _read_dm_role_auth_guild() -> Optional[int]:
@@ -4615,9 +4714,9 @@ class DiscordAdapter(BasePlatformAdapter):
                 listen_task.cancel()
 
             guild = self._client.get_guild(guild_id) if self._client is not None else None
-            for user_id, pcm_data in pending_inputs:
+            for user_id, pcm_data, opus_frames in pending_inputs:
                 if self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
-                    await self._process_voice_input(guild_id, user_id, pcm_data)
+                    await self._process_voice_input(guild_id, user_id, pcm_data, opus_frames)
 
             # Tear down the mixer (stops the continuous outgoing stream).
             if getattr(self, "_voice_mixers", None) is not None:
@@ -4636,6 +4735,20 @@ class DiscordAdapter(BasePlatformAdapter):
                 task.cancel()
             self._voice_text_channels.pop(guild_id, None)
             self._voice_sources.pop(guild_id, None)
+
+    def stop_voice_playback(self, guild_id: int) -> bool:
+        """Stop any active voice playback (mixer speech or legacy player) in a guild."""
+        stopped = False
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
+        if mixer is not None:
+            if getattr(mixer, "speech_active", False):
+                mixer.stop_speech()
+                stopped = True
+        vc = self._voice_clients.get(guild_id)
+        if vc and vc.is_playing():
+            vc.stop()
+            stopped = True
+        return stopped
 
     async def play_in_voice_channel(self, guild_id: int, audio_path: str) -> bool:
         """Play an audio file in the connected voice channel.
@@ -4908,7 +5021,7 @@ class DiscordAdapter(BasePlatformAdapter):
                 # (guild_id is in scope). Pass it so role checks are
                 # guild-scoped and not cross-guild.
                 _vc_guild = self._client.get_guild(guild_id) if self._client is not None else None
-                for user_id, pcm_data in completed:
+                for user_id, pcm_data, opus_frames in completed:
                     if not self._is_allowed_user(
                         str(user_id),
                         guild=_vc_guild,
@@ -4920,42 +5033,60 @@ class DiscordAdapter(BasePlatformAdapter):
                     # listener isn't disconnected mid-conversation (this also
                     # covers voice-on text-only sessions that never play audio).
                     self._reset_voice_timeout(guild_id)
-                    await self._process_voice_input(guild_id, user_id, pcm_data)
+                    await self._process_voice_input(guild_id, user_id, pcm_data, opus_frames)
         except asyncio.CancelledError:
             pass
         except Exception as e:
             logger.error("Voice listen loop error: %s", e, exc_info=True)
 
-    async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes):
-        """Convert PCM -> WAV -> STT -> callback."""
-        from tools.voice_mode import is_whisper_hallucination
+    async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes,
+                                   opus_frames: list = None):
+        """Convert PCM -> WAV + OGG -> cache copy -> callback."""
+        # Barge-in: immediately stop bot playback when user speaks
+        self.stop_voice_playback(guild_id)
+        import shutil
+        import uuid
 
-        tmp_f = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
-        wav_path = tmp_f.name
-        tmp_f.close()
+        wav_tmp = tempfile.NamedTemporaryFile(suffix=".wav", prefix="vc_listen_", delete=False)
+        wav_path = wav_tmp.name
+        wav_tmp.close()
+
+        cache_audio_dir = None
+        ogg_cache_path = None
+        wav_cache_path = None
+
         try:
+            # Always produce WAV (needed for STT fallback and fire-and-forget display)
             await asyncio.to_thread(VoiceReceiver.pcm_to_wav, pcm_data, wav_path)
 
-            from tools.transcription_tools import transcribe_audio
-            result = await asyncio.to_thread(transcribe_audio, wav_path)
+            hermes_home = os.getenv("HERMES_HOME", "/home/hermes/.hermes")
+            cache_audio_dir = os.path.join(hermes_home, "cache", "audio")
+            os.makedirs(cache_audio_dir, exist_ok=True)
 
-            if not result.get("success"):
-                return
-            transcript = result.get("transcript", "").strip()
-            if not transcript or is_whisper_hallucination(transcript):
-                return
+            uid_hex = uuid.uuid4().hex[:12]
+            wav_cache_path = os.path.join(cache_audio_dir, f"discord_{uid_hex}.wav")
+            shutil.copy2(wav_path, wav_cache_path)
 
-            logger.info("Voice input from user %d: %s", user_id, transcript[:100])
+            # Produce OGG from raw Opus frames (for Gemini native audio)
+            if opus_frames:
+                ogg_cache_path = os.path.join(cache_audio_dir, f"discord_{uid_hex}.ogg")
+                try:
+                    VoiceReceiver.opus_to_ogg(opus_frames, ogg_cache_path)
+                    logger.info("Voice input from user %d: ogg=%s wav=%s", user_id, ogg_cache_path, wav_cache_path)
+                except Exception as ogg_err:
+                    logger.warning("OGG mux failed for user %d: %s", user_id, ogg_err)
+                    ogg_cache_path = None
+            else:
+                logger.info("Voice input from user %d: wav=%s (no opus frames)", user_id, wav_cache_path)
 
             if self._voice_input_callback:
                 await self._voice_input_callback(
                     guild_id=guild_id,
                     user_id=user_id,
-                    transcript=transcript,
+                    audio_path=ogg_cache_path or wav_cache_path,
+                    wav_path=wav_cache_path,
                 )
         except Exception as e:
-            # CalledProcessError from pcm_to_wav carries ffmpeg's captured
-            # stderr — surface it, or the log only says "exit status N".
             _ff_err = getattr(e, "stderr", None)
             if _ff_err:
                 if isinstance(_ff_err, bytes):

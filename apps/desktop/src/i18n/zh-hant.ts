@@ -829,6 +829,10 @@ export const zhHant = defineLocale({
       failedLoad: 'API 金鑰載入失敗',
       empty: '此類別尚未有任何設定。'
     },
+    search: {
+      placeholder: '搜尋所有設定...',
+      pill: '搜尋'
+    },
     profileScope: {
       appliesTo: '套用至',
       editsProfile: profile => `此頁面的變更將套用至「${profile}」設定檔。`
@@ -1250,8 +1254,10 @@ export const zhHant = defineLocale({
     gatewayStopped: '訊息閘道已停止',
     hermesActiveSessions: (version, count) => `Hermes ${version} · 活躍工作階段 ${count}`,
     restartGateway: '重新啟動閘道',
+    openBrowser: '開啟瀏覽器',
     gatewayRestartFailed: '閘道重新啟動失敗。',
     updateHermes: '更新 Hermes',
+    reloadWindow: '重新載入視窗',
     actionRunning: '執行中',
     actionDone: '完成',
     actionFailed: '失敗',
@@ -2481,6 +2487,8 @@ export const zhHant = defineLocale({
     web: {
       appFailedToBoot: '預覽應用程式啟動失敗',
       serverNotFound: '找不到伺服器',
+      remoteLoopback:
+        '這個位址指向執行代理的那台機器，而不是本機。瀏覽器窗格會在本機載入頁面，因此遠端開發伺服器需要連接埠轉送或可連線的主機名稱。',
       failedToLoad: '預覽載入失敗',
       tryAgain: '重試',
       restarting: 'Hermes 正在重新啟動...',
@@ -2494,6 +2502,12 @@ export const zhHant = defineLocale({
       showConsole: '顯示預覽主控台',
       hideDevTools: '隱藏預覽 DevTools',
       openDevTools: '開啟預覽 DevTools',
+      goBack: '上一頁',
+      goForward: '下一頁',
+      reload: '重新載入頁面',
+      address: '網址',
+      addressPlaceholder: '輸入網址',
+      blankPageBody: '在上方輸入網址開始瀏覽，或請 Hermes 開啟頁面。',
       finishedRestarting: message => `Hermes 已完成預覽伺服器重新啟動${message ? `：${message}` : ''}`,
       failedRestarting: message => `伺服器重新啟動失敗：${message}`,
       unknownError: '未知錯誤',

@@ -2517,6 +2517,34 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
                 agent._client_log_context(),
             )
             return client
+    elif agent.provider:
+        from agent.gemini_native_adapter import (
+            GeminiNativeClient,
+            is_native_gemini_base_url,
+            is_gemini_native_provider,
+        )
+        _prov = str(getattr(agent, "requested_provider", "") or agent.provider or "").removeprefix("custom:").strip()
+        base_url = str(client_kwargs.get("base_url", "") or "")
+        if _prov and is_gemini_native_provider(_prov) and is_native_gemini_base_url(base_url, provider=_prov):
+            safe_kwargs = {
+                k: v for k, v in client_kwargs.items()
+                if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+            }
+            if "http_client" not in safe_kwargs:
+                keepalive_http = agent._build_keepalive_http_client(
+                    base_url, verify=httpx_verify,
+                )
+                if keepalive_http is not None:
+                    safe_kwargs["http_client"] = keepalive_http
+            client = GeminiNativeClient(**safe_kwargs)
+            _ra().logger.info(
+                "Gemini native client created for custom provider '%s' (%s, shared=%s) %s",
+                _prov,
+                reason,
+                shared,
+                agent._client_log_context(),
+            )
+            return client
     # Inject TCP keepalives so the kernel detects dead provider connections
     # instead of letting them sit silently in CLOSE-WAIT (#10324).  Without
     # this, a peer that drops mid-stream leaves the socket in a state where

@@ -85,12 +85,43 @@ def gemini_requires_tool_call_ids(model: str) -> bool:
     return version is not None and version >= 3
 
 
-def is_native_gemini_base_url(base_url: str) -> bool:
-    """Return True when the endpoint speaks Gemini's native REST API."""
+def is_gemini_native_provider(provider_name: str) -> bool:
+    """Return True when a custom provider is flagged as native Gemini in config.
+
+    Checks ``providers.<name>.native_gemini: true`` in the Hermes config.
+    This allows custom proxy endpoints that speak Gemini's native REST API
+    (generateContent / streamGenerateContent) to use the Gemini native adapter
+    instead of the generic OpenAI-compatible path.
+    """
+    pname = str(provider_name or "").strip()
+    if not pname:
+        return False
+    try:
+        from hermes_cli.config import load_config_readonly
+        cfg = load_config_readonly() or {}
+    except Exception:
+        return False
+    providers = cfg.get("providers") or {}
+    if isinstance(providers, dict):
+        psec = providers.get(pname) or {}
+        if isinstance(psec, dict) and psec.get("native_gemini"):
+            return True
+    return False
+
+
+def is_native_gemini_base_url(base_url: str, *, provider: str = "") -> bool:
+    """Return True when the endpoint speaks Gemini's native REST API.
+
+    Matches the canonical Google endpoint OR any custom provider flagged
+    ``native_gemini: true`` in config.yaml (checked via *provider*).
+    """
     normalized = str(base_url or "").strip().rstrip("/").lower()
     if not normalized:
         return False
     if "generativelanguage.googleapis.com" not in normalized:
+        # Second path: check config for a custom Gemini-native provider
+        if provider and is_gemini_native_provider(provider):
+            return not normalized.endswith("/openai")
         return False
     return not normalized.endswith("/openai")
 
@@ -283,6 +314,26 @@ def _extract_multimodal_parts(content: Any) -> List[Dict[str, Any]]:
                 parts.append({"text": text})
         elif ptype == "image_url":
             url = ((item.get("image_url") or {}).get("url") or "")
+            if not isinstance(url, str) or not url.startswith("data:"):
+                continue
+            try:
+                header, encoded = url.split(",", 1)
+                mime = header.split(":", 1)[1].split(";", 1)[0]
+                raw = base64.b64decode(encoded)
+            except Exception:
+                continue
+            parts.append(
+                {
+                    "inlineData": {
+                        "mimeType": mime,
+                        "data": base64.b64encode(raw).decode("ascii"),
+                    }
+                }
+            )
+        elif ptype == "audio_url":
+            # Native audio support for models like Gemini that accept audio
+            # input. The format mirrors image_url but uses audio MIME types.
+            url = ((item.get("audio_url") or {}).get("url") or "")
             if not isinstance(url, str) or not url.startswith("data:"):
                 continue
             try:

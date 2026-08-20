@@ -273,6 +273,79 @@ def _supports_vision_override(
     return None
 
 
+def _supports_audio_input_override(
+    cfg: Optional[Dict[str, Any]],
+    provider: str,
+    model: str,
+    *,
+    requested_provider: str = "",
+) -> Optional[bool]:
+    """Resolve user-declared audio-input capability from config.yaml.
+
+    Resolution order, first hit wins:
+      1. ``model.supports_audio_input`` (top-level shortcut)
+      2. ``providers.<provider>.models.<model>.supports_audio_input``
+      2b. ``custom_providers`` (legacy list form) ``.models.<model>``
+
+    Returns None when no override is set, so the caller falls through to
+    models.dev.
+    """
+    if not isinstance(cfg, dict):
+        return None
+
+    # 1. Top-level shortcut
+    model_cfg_raw = cfg.get("model")
+    model_cfg: Dict[str, Any] = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
+    top = _coerce_capability_bool(model_cfg.get("supports_audio_input"))
+    if top is not None:
+        return top
+
+    # 2. Per-provider, per-model
+    config_provider = str(model_cfg.get("provider") or "").strip()
+    provider_candidates: List[str] = []
+    for candidate in (requested_provider, provider, config_provider):
+        if not candidate:
+            continue
+        provider_candidates.append(candidate)
+        if candidate.startswith("custom:"):
+            stripped_candidate = candidate[len("custom:"):]
+            if stripped_candidate:
+                provider_candidates.append(stripped_candidate)
+    providers_raw = cfg.get("providers")
+    providers_cfg: Dict[str, Any] = providers_raw if isinstance(providers_raw, dict) else {}
+    for p in dict.fromkeys(provider_candidates):
+        entry_raw = providers_cfg.get(p)
+        entry: Dict[str, Any] = entry_raw if isinstance(entry_raw, dict) else {}
+        models_raw = entry.get("models")
+        models_cfg: Dict[str, Any] = models_raw if isinstance(models_raw, dict) else {}
+        per_model_raw = models_cfg.get(model)
+        per_model: Dict[str, Any] = per_model_raw if isinstance(per_model_raw, dict) else {}
+        coerced = _coerce_capability_bool(per_model.get("supports_audio_input"))
+        if coerced is not None:
+            return coerced
+
+    # 2b. Legacy list-style custom_providers
+    custom_providers = cfg.get("custom_providers")
+    if isinstance(custom_providers, list):
+        for candidate in dict.fromkeys(provider_candidates):
+            candidate_name = candidate.strip().lower()
+            for entry_raw in custom_providers:
+                if not isinstance(entry_raw, dict):
+                    continue
+                entry_name = str(entry_raw.get("name") or "").strip().lower()
+                if entry_name != candidate_name:
+                    continue
+                models_raw = entry_raw.get("models")
+                models_cfg = models_raw if isinstance(models_raw, dict) else {}
+                per_model_raw = models_cfg.get(model)
+                per_model = per_model_raw if isinstance(per_model_raw, dict) else {}
+                coerced = _coerce_capability_bool(per_model.get("supports_audio_input"))
+                if coerced is not None:
+                    return coerced
+
+    return None
+
+
 def _resolve_inference_base_url(
     cfg: Optional[Dict[str, Any]],
     provider: str,
@@ -821,8 +894,76 @@ def build_native_content_parts(
     return parts, skipped
 
 
+def build_native_audio_parts(
+    user_text: str,
+    audio_paths: List[str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Build an OpenAI-style ``content`` list for native audio attachments.
+
+    Similar to ``build_native_content_parts`` but for audio files. Each local
+    file is read, base64-encoded, and wrapped as::
+
+        {"type": "audio_url", "audio_url": {"url": "data:audio/ogg;base64,..."}}
+
+    The ``audio_url`` type is a convention understood by adapters that support
+    native audio input (e.g. Gemini via ``gemini_native_adapter``). Adapters
+    that don't recognise it simply ignore the part.
+
+    Returns (content_parts, skipped). Skipped entries are local paths that
+    couldn't be read or had undetectable MIME types.
+    """
+    import mimetypes as _mimetypes
+
+    skipped: List[str] = []
+    audio_parts: List[Dict[str, Any]] = []
+    attached_paths: List[str] = []
+
+    for raw_path in audio_paths:
+        p = Path(raw_path)
+        if not p.exists() or not p.is_file():
+            skipped.append(str(raw_path))
+            continue
+        try:
+            data = p.read_bytes()
+        except Exception as exc:
+            logger.warning("image_routing: failed to read audio %s — %s", p, exc)
+            skipped.append(str(raw_path))
+            continue
+        mime, _ = _mimetypes.guess_type(str(p))
+        if not mime or not mime.startswith("audio/"):
+            logger.warning(
+                "image_routing: %s has non-audio MIME %s, skipping native attachment",
+                p, mime,
+            )
+            skipped.append(str(raw_path))
+            continue
+        b64 = base64.b64encode(data).decode("ascii")
+        audio_parts.append({
+            "type": "audio_url",
+            "audio_url": {"url": f"data:{mime};base64,{b64}"},
+        })
+        attached_paths.append(str(p))
+
+    text = (user_text or "").strip()
+
+    if attached_paths:
+        base_text = text or "[Audio attached]"
+        hint_lines = [f"[Audio attached at: {p}]" for p in attached_paths]
+        combined_text = f"{base_text}\n\n" + "\n".join(hint_lines)
+        parts: List[Dict[str, Any]] = [{"type": "text", "text": combined_text}]
+        parts.extend(audio_parts)
+        return parts, skipped
+
+    # No audio successfully attached — fall back to plain text-only behaviour.
+    parts = []
+    if text:
+        parts.append({"type": "text", "text": text})
+    return parts, skipped
+
+
 __all__ = [
     "decide_image_input_mode",
     "build_native_content_parts",
+    "build_native_audio_parts",
     "extract_image_refs",
 ]
