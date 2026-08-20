@@ -4746,9 +4746,17 @@ class DiscordAdapter(BasePlatformAdapter):
         stopped = False
         mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
         if mixer is not None:
+            # Mixer path: only drop in-flight speech.  NEVER call vc.stop() —
+            # the mixer is a continuous AudioSource that must keep being polled
+            # by discord.py sender thread for the life of the connection.
+            # Stopping vc.play() kills the read() drain loop; any later
+            # play_speech() queues frames that never play (120s timeout).
             if getattr(mixer, "speech_active", False):
                 mixer.stop_speech()
                 stopped = True
+            return stopped
+        # Legacy one-shot path: vc.stop() is safe — each clip is a discrete
+        # FFmpegPCMAudio source, not a continuous mixer.
         vc = self._voice_clients.get(guild_id)
         if vc and vc.is_playing():
             vc.stop()
