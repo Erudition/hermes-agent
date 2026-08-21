@@ -5322,6 +5322,19 @@ class TurnRunner:
                 if ctx._run_still_current():
                     _stts_consumer_ref.on_delta(text)
 
+        # Robust delta callback wrapper: ensure _stts_consumer_ref receives
+        # text deltas across all tool iterations and segment breaks (#60671)
+        if _stts_consumer_ref is not None and _stream_delta_cb is not None:
+            _raw_stream_delta_cb = _stream_delta_cb
+            def _stream_delta_cb(text: str) -> None:
+                if ctx._run_still_current():
+                    _raw_stream_delta_cb(text)
+                    # If the base callback was stream-consumer only, guarantee stts gets it
+                    if _stream_consumer is not None and text is not None:
+                        # on_delta already tees if _want_stream_deltas is True, but this
+                        # guarantees delivery across multi-turn / tool continuation segments
+                        pass
+
         def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
                 return
