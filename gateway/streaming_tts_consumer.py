@@ -42,6 +42,7 @@ import asyncio
 import logging
 import queue
 import threading
+import time
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
@@ -104,6 +105,12 @@ class StreamingTTSConsumer:
 
         # Pre-allocate the strip-markdown helper lazily to avoid import cycles.
         self._strip_markdown = None
+        # Delta-latency diagnostics (RCA: first VC turn after restart silent)
+        self._created_monotonic = time.monotonic()
+        self._first_delta_at = None
+        self._deltas_received = 0
+        self._chars_received = 0
+        self._clauses_enqueued = 0
 
     # ------------------------------------------------------------------
     # Public properties
@@ -157,8 +164,24 @@ class StreamingTTSConsumer:
         """Receive a text delta from the agent. Non-blocking."""
         if self._aborted or not self.active or self._finished:
             return
+        if text is not None:
+            self._deltas_received += 1
+            self._chars_received += len(text)
+            if self._first_delta_at is None:
+                self._first_delta_at = time.monotonic()
+                logger.info(
+                    "stts diag: first delta received t=%.3fs after consumer creation (%d chars)",
+                    self._first_delta_at - self._created_monotonic, len(text),
+                )
         try:
             for clause in self._chunker.feed(text):
+                self._clauses_enqueued += 1
+                logger.info(
+                    "stts diag: clause #%d enqueued (%d chars, t=%.3fs, deltas=%d/%d chars)",
+                    self._clauses_enqueued, len(clause),
+                    time.monotonic() - self._created_monotonic,
+                    self._deltas_received, self._chars_received,
+                )
                 self._queue.put_nowait(clause)
         except queue.Full:
             self._dropped = True
@@ -179,7 +202,15 @@ class StreamingTTSConsumer:
         if self._aborted or not self.active:
             return
         try:
-            for clause in self._chunker.flush():
+            flushed = list(self._chunker.flush())
+            logger.info(
+                "stts diag: finish flush emitted %d clause(s); totals: %d deltas, %d chars, "
+                "%d clauses enqueued (t=%.3fs)",
+                len(flushed), self._deltas_received, self._chars_received,
+                self._clauses_enqueued, time.monotonic() - self._created_monotonic,
+            )
+            for clause in flushed:
+                self._clauses_enqueued += 1
                 self._queue.put_nowait(clause)
         except queue.Full:
             self._dropped = True

@@ -5334,6 +5334,12 @@ class TurnRunner:
                         # on_delta already tees if _want_stream_deltas is True, but this
                         # guarantees delivery across multi-turn / tool continuation segments
                         pass
+                elif text is not None:
+                    logger.warning(
+                        "stts diag: delta DROPPED - run not current (%d chars); "
+                        "suspect run_generation mismatch",
+                        len(text),
+                    )
 
         def _interim_assistant_cb(text: str, *, already_streamed: bool = False) -> None:
             if not ctx._run_still_current():
