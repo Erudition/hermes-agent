@@ -5355,9 +5355,33 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("Voice listen loop error: %s", e, exc_info=True)
 
+    _BARGEIN_MIN_UTTERANCE_SEC = 1.0
+
+    def _playback_active(self, guild_id: int) -> bool:
+        """True when any voice audio is currently playing in the guild."""
+        if self._streaming_tts_by_guild.get(guild_id):
+            return True
+        mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
+        if mixer is not None and getattr(mixer, "speech_active", False):
+            return True
+        vc = self._voice_clients.get(guild_id)
+        return bool(vc and vc.is_playing())
+
     async def _process_voice_input(self, guild_id: int, user_id: int, pcm_data: bytes,
                                    opus_frames: list = None):
         """Convert PCM -> WAV + OGG -> cache copy -> callback."""
+        # Sub-second noises (bumps, mic knocks) that slip past VAD must not
+        # cancel playback or reach the model mid-speech. Genuine barge-in
+        # speech is longer than the threshold.
+        if self._playback_active(guild_id):
+            duration_s = len(pcm_data) / (48000 * 2 * 2)  # s16le 48kHz stereo
+            if duration_s < self._BARGEIN_MIN_UTTERANCE_SEC:
+                logger.info(
+                    "Voice input from user %d ignored: %.2fs clip during playback "
+                    "(< %.1fs barge-in minimum)",
+                    user_id, duration_s, self._BARGEIN_MIN_UTTERANCE_SEC,
+                )
+                return
         # Barge-in: immediately stop bot playback when user speaks
         self.stop_voice_playback(guild_id)
         import shutil
