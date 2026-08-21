@@ -28480,7 +28480,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         if (
             _stts_adapter is not None
-            and _is_voice_input
             and _stts_adapter._should_auto_tts_for_chat(source.chat_id)
         ):
             try:
