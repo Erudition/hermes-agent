@@ -469,6 +469,12 @@ def pcm_24k_mono_to_48k_stereo(pcm: bytes) -> bytes:
     """
     if not pcm:
         return b""
+    # Streaming chunks can split a 16-bit sample across writes; drop any
+    # trailing odd byte (it belongs to the next chunk's first sample).
+    if len(pcm) % 2:
+        pcm = pcm[:-1]
+        if not pcm:
+            return b""
     np = _require_numpy()
     samples = np.frombuffer(pcm, dtype="<i2")
     up = np.repeat(samples, 2)          # 2x upsample (nearest neighbour)

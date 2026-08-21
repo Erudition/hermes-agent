@@ -635,7 +635,12 @@ class VoiceReceiver:
             self._opus_buffers.clear()
             self._last_packet_time.clear()
             self._decoders.clear()
-            self._ssrc_to_user.clear()
+            # NOTE: _ssrc_to_user is deliberately NOT cleared here.  Discord
+            # sends SPEAKING (op 5) only on transitions, so a replacement
+            # receiver would never learn about users who were already
+            # speaking.  The map is carried over via inherit_ssrc_map() at
+            # the (re)creation site; stale entries are harmless because new
+            # SPEAKING events overwrite them.
         logger.info("VoiceReceiver stopped")
 
     def pause(self):
@@ -651,6 +656,25 @@ class VoiceReceiver:
     def map_ssrc(self, ssrc: int, user_id: int):
         with self._lock:
             self._ssrc_to_user[ssrc] = user_id
+
+    def inherit_ssrc_map(self, other: "VoiceReceiver") -> None:
+        """Carry SSRC->user mappings over from a previous receiver instance.
+
+        SPEAKING events are transition-only: users who were already talking
+        when this receiver started will never produce a new event, so a
+        fresh receiver would stay deaf to them.  Copy the old map (same
+        voice gateway session reuses the same SSRC space); stale entries
+        are overwritten by real SPEAKING events as they arrive.
+        """
+        try:
+            with other._lock:
+                inherited = dict(other._ssrc_to_user)
+            with self._lock:
+                self._ssrc_to_user.update(inherited)
+            if inherited:
+                logger.info("Inherited %d SSRC mapping(s) from previous receiver", len(inherited))
+        except Exception:
+            pass
 
     def _install_speaking_hook(self, conn):
         """Wrap the voice websocket hook to capture SPEAKING events (op 5).
@@ -806,6 +830,14 @@ class VoiceReceiver:
         if dave_session:
             with self._lock:
                 user_id = self._ssrc_to_user.get(ssrc, 0)
+            if not user_id:
+                # Discord only sends SPEAKING (op 5) on state transitions; a
+                # user who was already talking when we (re)joined never
+                # triggers one.  Try the sole-allowed-member heuristic before
+                # giving up, otherwise their DAVE audio is dropped forever.
+                user_id = self._infer_user_for_ssrc(ssrc)
+                if user_id:
+                    logger.info("Inferred ssrc=%d -> user=%d for DAVE decrypt", ssrc, user_id)
             if user_id:
                 try:
                     import davey
@@ -881,6 +913,17 @@ class VoiceReceiver:
         except Exception:
             pass
         return 0
+
+    def has_recent_activity(self, window: float = 2.0) -> bool:
+        """True if any inbound RTP audio arrived within the last ``window`` seconds.
+
+        Only real user packets count: the bot's own SSRC is skipped in
+        _on_packet and capture is suppressed while paused, so bot playback
+        never registers as inbound activity.
+        """
+        now = time.monotonic()
+        with self._lock:
+            return any(now - t <= window for t in self._last_packet_time.values())
 
     def check_silence(self) -> list:
         """Return list of (user_id, pcm_bytes, opus_frames) for completed utterances."""
@@ -1169,7 +1212,7 @@ class _StreamingTTSSink(discord.AudioSource):
         if self._np is None:
             import numpy as np_mod
             self._np = np_mod
-        np.clip(frame, -32768, 32767, out=frame)
+        self._np.clip(frame, -32768, 32767, out=frame)
         return frame.astype(self._np.int16).tobytes()
 
 
@@ -4735,6 +4778,12 @@ class DiscordAdapter(BasePlatformAdapter):
             # Start voice receiver (Phase 2: listen to users)
             try:
                 receiver = VoiceReceiver(vc, allowed_user_ids=self._allowed_user_ids)
+                prev_receiver = self._voice_receivers.get(guild_id)
+                if prev_receiver is not None:
+                    # SPEAKING is transition-only: carry the previous
+                    # receiver's SSRC map so already-speaking users remain
+                    # audible after a receiver restart.
+                    receiver.inherit_ssrc_map(prev_receiver)
                 receiver.start()
                 self._voice_receivers[guild_id] = receiver
                 self._voice_listen_tasks[guild_id] = asyncio.ensure_future(
@@ -5245,6 +5294,7 @@ class DiscordAdapter(BasePlatformAdapter):
         if not receiver:
             return
         last_keepalive = time.monotonic()
+        last_activity_reset = last_keepalive
         try:
             while receiver._running:
                 await asyncio.sleep(0.2)
@@ -5260,6 +5310,16 @@ class DiscordAdapter(BasePlatformAdapter):
                             vc._connection.send_packet(b'\xf8\xff\xfe')
                     except Exception:
                         pass
+
+                # Continuous dictation without a >=SILENCE_THRESHOLD pause
+                # never yields a completed utterance, so the reset inside the
+                # completion branch below never fires and the bot disconnects
+                # mid-sentence exactly VOICE_TIMEOUT after joining.  Active
+                # inbound speech counts as activity too; throttled to avoid
+                # timer churn every 200ms tick.
+                if now - last_activity_reset >= 30.0 and receiver.has_recent_activity(2.0):
+                    last_activity_reset = now
+                    self._reset_voice_timeout(guild_id)
 
                 completed = receiver.check_silence()
                 # Voice inputs always originate from a specific guild
