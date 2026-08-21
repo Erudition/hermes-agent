@@ -5097,6 +5097,8 @@ class DiscordAdapter(BasePlatformAdapter):
                 logger.warning("Mixer decode failed for %s; falling back to legacy playback", audio_path)
 
             # ── Legacy one-shot path (no mixer) ─────────────────────────
+            # Preempt any in-flight streaming TTS playback immediately before legacy playback
+            self._abort_streaming_session_for_guild(guild_id)
             # Pause voice receiver while playing (echo prevention)
             receiver = self._voice_receivers.get(guild_id)
             if receiver:
