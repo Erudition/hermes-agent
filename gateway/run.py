@@ -29137,10 +29137,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await _stts.wait_complete(timeout=10.0)
                 except Exception as _stts_done_err:
                     logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
+                if not _stts.done and _stts.audible:
+                    # Audio already reached the user: keep draining instead of
+                    # truncating the reply mid-word.  Playback ends no later
+                    # than the adapter's own 120s drain deadline plus margin;
+                    # barge-in still cuts it short immediately.
+                    try:
+                        await _stts.wait_complete(timeout=150.0)
+                    except Exception as _stts_drain_err:
+                        logger.debug("streaming TTS drain wait error: %s", _stts_drain_err)
                 if not _stts.done:
-                    # Timeout before or after audible audio: abort to free
-                    # the consumer task.  Audible streams retain suppression;
-                    # silent streams remain eligible for whole-file fallback.
+                    # Never-audible streams (or a genuinely stuck drain):
+                    # abort to free the consumer task.  Audible streams
+                    # retain suppression; silent streams remain eligible
+                    # for whole-file fallback.
+                    logger.warning(
+                        "streaming TTS finalisation timeout (audible=%s), aborting",
+                        _stts.audible,
+                    )
                     _stts.abort("streaming TTS finalisation timeout")
                     await _stts.wait_complete(timeout=2.0)
                 if _stts.suppress_whole_file and adapter is not None:
