@@ -925,6 +925,21 @@ class VoiceReceiver:
         with self._lock:
             return any(now - t <= window for t in self._last_packet_time.values())
 
+    def has_active_speech(self, min_duration: float = 0.25, max_staleness: float = 0.5) -> bool:
+        """True if any allowed audio buffer has accumulated >= min_duration of speech and received packets recently."""
+        now = time.monotonic()
+        with self._lock:
+            for ssrc, buf in self._buffers.items():
+                last_time = self._last_packet_time.get(ssrc, 0)
+                if now - last_time <= max_staleness:
+                    user_id = self._ssrc_to_user.get(ssrc, 0)
+                    if self._allowed_user_ids and user_id and str(user_id) not in self._allowed_user_ids:
+                        continue
+                    buf_duration = len(buf) / (self.SAMPLE_RATE * self.CHANNELS * 2)
+                    if buf_duration >= min_duration:
+                        return True
+        return False
+
     def check_silence(self) -> list:
         """Return list of (user_id, pcm_bytes, opus_frames) for completed utterances."""
         now = time.monotonic()
@@ -5331,6 +5346,11 @@ class DiscordAdapter(BasePlatformAdapter):
                 if now - last_activity_reset >= 30.0 and receiver.has_recent_activity(2.0):
                     last_activity_reset = now
                     self._reset_voice_timeout(guild_id)
+
+                # Early barge-in: abort bot playback immediately upon detecting user speech onset
+                if self._playback_active(guild_id) and receiver.has_active_speech(0.25):
+                    logger.info("Barge-in: speech onset detected in guild %d, stopping playback immediately", guild_id)
+                    self.stop_voice_playback(guild_id)
 
                 completed = receiver.check_silence()
                 # Voice inputs always originate from a specific guild
