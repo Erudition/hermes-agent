@@ -5378,8 +5378,8 @@ class DiscordAdapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("Voice listen loop error: %s", e, exc_info=True)
 
-    _BARGEIN_MIN_UTTERANCE_SEC = 1.0
-    _BARGEIN_SPEECH_ONSET_SEC = 0.85
+    _BARGEIN_MIN_UTTERANCE_SEC = 2.0
+    _BARGEIN_SPEECH_ONSET_SEC = 2.0
 
     def _playback_active(self, guild_id: int) -> bool:
         """True when any voice audio is currently playing in the guild."""
