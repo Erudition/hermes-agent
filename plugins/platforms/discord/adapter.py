@@ -5347,9 +5347,12 @@ class DiscordAdapter(BasePlatformAdapter):
                     last_activity_reset = now
                     self._reset_voice_timeout(guild_id)
 
-                # Early barge-in: abort bot playback immediately upon detecting user speech onset
-                if self._playback_active(guild_id) and receiver.has_active_speech(0.25):
-                    logger.info("Barge-in: speech onset detected in guild %d, stopping playback immediately", guild_id)
+                # Early barge-in: abort bot playback once active user speech exceeds onset threshold (filters sub-second noises)
+                if self._playback_active(guild_id) and receiver.has_active_speech(self._BARGEIN_SPEECH_ONSET_SEC):
+                    logger.info(
+                        "Barge-in: speech onset (>= %.2fs) detected in guild %d, stopping playback immediately",
+                        self._BARGEIN_SPEECH_ONSET_SEC, guild_id,
+                    )
                     self.stop_voice_playback(guild_id)
 
                 completed = receiver.check_silence()
@@ -5376,6 +5379,7 @@ class DiscordAdapter(BasePlatformAdapter):
             logger.error("Voice listen loop error: %s", e, exc_info=True)
 
     _BARGEIN_MIN_UTTERANCE_SEC = 1.0
+    _BARGEIN_SPEECH_ONSET_SEC = 0.85
 
     def _playback_active(self, guild_id: int) -> bool:
         """True when any voice audio is currently playing in the guild."""
