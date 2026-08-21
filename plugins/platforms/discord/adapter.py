@@ -4960,6 +4960,7 @@ class DiscordAdapter(BasePlatformAdapter):
         gid = session["guild_id"]
         try:
             if interrupted:
+                logger.info("Streaming TTS interrupted (guild=%s, mode=%s)", gid, session["mode"])
                 self._teardown_streaming_session(session)
                 return
             deadline = time.monotonic() + 120.0
@@ -4985,6 +4986,10 @@ class DiscordAdapter(BasePlatformAdapter):
         session = self._streaming_tts_sessions.pop(id(handle), None)
         if session is None:
             return
+        logger.info(
+            "Streaming TTS aborted (guild=%s, mode=%s, reason=%s)",
+            session["guild_id"], session["mode"], error or "unspecified",
+        )
         self._streaming_tts_by_guild.pop(session["guild_id"], None)
         self._teardown_streaming_session(session)
 
@@ -5016,6 +5021,10 @@ class DiscordAdapter(BasePlatformAdapter):
         handle = session.get("handle")
         if handle is not None:
             handle.aborted = True
+        logger.info(
+            "Barge-in: aborted streaming TTS (guild=%s, mode=%s)",
+            guild_id, session["mode"],
+        )
         self._teardown_streaming_session(session)
         return True
 
