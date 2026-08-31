@@ -21861,7 +21861,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             from tools.transcription_tools import transcribe_audio
             from tools.voice_mode import is_whisper_hallucination
 
-            res = await asyncio.to_thread(transcribe_audio, audio_path)
+            def _reniced_transcribe():
+                import os
+                # Lower process priority to 19 and pin to a single core (Core 3)
+                try:
+                    os.nice(19)
+                except Exception:
+                    pass
+                try:
+                    # Pin Whisper to core 3 so cores 0-2 are free for Pocket TTS and main loop
+                    os.sched_setaffinity(0, {3})
+                except Exception:
+                    pass
+                return transcribe_audio(audio_path)
+                
+            res = await asyncio.to_thread(_reniced_transcribe)
             if res and isinstance(res, dict) and res.get("success"):
                 raw_text = res.get("transcript", "").strip()
                 if is_whisper_hallucination(raw_text):
@@ -24546,6 +24560,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         seen = set()
         audio_paths = [p for p in audio_paths if p not in seen and not seen.add(p)]
+        agent_cfg = getattr(self.config, "agent", {})
+        if isinstance(agent_cfg, dict) and agent_cfg.get("image_input_mode") == "native":
+            return user_text, []
         if not getattr(self.config, "stt_enabled", True):
             notes = []
             for path in audio_paths:

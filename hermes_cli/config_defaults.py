@@ -2178,6 +2178,15 @@ DEFAULT_CONFIG = {
         # The adapter also probes clip duration and extends this floor by a
         # padding window, so long TTS readbacks are not cut at exactly 120s.
         "voice_playback_timeout_seconds": 120,
+        # When True, the bot auto-joins and follows an allowed user into a
+        # Discord voice channel, binding transcript/TTS output to the voice
+        # channel's integrated text chat. Default False (opt-in): this is a
+        # behavior change that auto-connects to VC and speaks.
+        "voice_auto_follow": False,
+        # Seconds the auto-follow lingers after the last allowed user leaves
+        # a voice channel before disconnecting. 0 = fall back to
+        # voice_channel_inactivity_timeout_seconds (the general idle auto-leave).
+        "voice_auto_follow_leave_delay_seconds": 15,
         # Voice-channel audio effects (the continuous mixer). OFF by default.
         # When enabled, the bot installs a software mixer on the outgoing voice
         # stream so a low ambient "thinking" bed, verbal acknowledgements, and

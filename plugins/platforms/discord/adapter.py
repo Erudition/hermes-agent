@@ -571,7 +571,7 @@ class VoiceReceiver:
     completed utterances via a callback.
     """
 
-    SILENCE_THRESHOLD = 1.5    # seconds of silence → end of utterance
+    SILENCE_THRESHOLD = 1.0    # seconds of silence → end of utterance
     MIN_SPEECH_DURATION = 0.5  # minimum seconds to process (skip noise)
     SAMPLE_RATE = 48000        # Discord native rate
     CHANNELS = 2               # Discord sends stereo
@@ -1260,6 +1260,10 @@ class DiscordAdapter(BasePlatformAdapter):
     # Auto-disconnect from voice channel after this many seconds of inactivity.
     # Config key: discord.voice_channel_inactivity_timeout_seconds (0 disables)
     VOICE_TIMEOUT = 300
+    # Voice auto-follow is OFF by default (opt-in via
+    # discord.voice_auto_follow) — auto-joining VC and speaking is a behavior
+    # change that should be deliberate.
+    VOICE_AUTO_FOLLOW_DEFAULT = False
     # Minimum seconds to wait for a single voice playback. The effective limit
     # scales with the probed clip duration so long readbacks are not cut off at
     # a hard two-minute ceiling.
@@ -1297,6 +1301,23 @@ class DiscordAdapter(BasePlatformAdapter):
         self._voice_timeout_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> timeout task
         self._voice_timeout_seconds = self._load_voice_timeout()
         self._playback_timeout_seconds = self._load_playback_timeout()
+        # Voice auto-follow: when enabled, the bot joins/follows an allowed
+        # user into voice and binds transcript/TTS to the VC's text chat.
+        self._voice_auto_follow: bool = self._load_voice_auto_follow()
+        # Seconds to linger after the last allowed user leaves before the
+        # auto-follow disconnects. 0 = defer to the general inactivity timer.
+        self._voice_auto_follow_leave_delay: int = self._load_discord_int_config(
+            "voice_auto_follow_leave_delay_seconds", 0, minimum=0,
+        )
+        # guild_id -> {user_id(int) -> voice_channel_id(int|None)}. Always kept
+        # fresh by on_voice_state_update (even when auto-follow is off) so a
+        # runtime toggle has up-to-date state without a reconnect.
+        self._voice_follow_members: Dict[int, Dict[int, Any]] = {}
+        # guild_id -> pending auto-follow task (latest-wins coalescing slot).
+        self._voice_follow_pending: Dict[int, asyncio.Task] = {}
+        # guild_id set here when the operator has taken manual control
+        # (/voice leave) and the auto-follow must not override that choice.
+        self._voice_follow_manual_guilds: set = set()
         # Phase 2: voice listening
         self._voice_receivers: Dict[int, VoiceReceiver] = {}  # guild_id -> VoiceReceiver
         self._voice_listen_tasks: Dict[int, asyncio.Task] = {}  # guild_id -> listen loop
@@ -1629,35 +1650,70 @@ class DiscordAdapter(BasePlatformAdapter):
 
             @self._client.event
             async def on_voice_state_update(member, before, after):
-                """Track voice channel join/leave events."""
-                # Only track channels where the bot is connected
-                bot_guild_ids = set(adapter_self._voice_clients.keys())
-                if not bot_guild_ids:
-                    return
-                guild_id = member.guild.id
-                if guild_id not in bot_guild_ids:
-                    return
-                # Ignore the bot itself
-                if member == adapter_self._client.user:
-                    return
+                """Track voice channel join/leave events and auto-follow users.
 
-                joined = before.channel is None and after.channel is not None
-                left = before.channel is not None and after.channel is None
-                switched = (
-                    before.channel is not None
-                    and after.channel is not None
-                    and before.channel != after.channel
-                )
+                Keeps ``_voice_follow_members`` fresh for the active guild (even
+                while auto-follow is disabled, so a runtime toggle has current
+                state) and schedules a coalescing auto-follow task when an
+                allowed user joins/moves/leaves. This handler must stay fast and
+                non-blocking: it only updates tracking and schedules a task —
+                it never awaits a voice network op inline, so it cannot stall
+                the discord.py event dispatch or compromise gateway connectivity.
+                """
+                try:
+                    guild = member.guild
+                    guild_id = guild.id
+                    # Ignore the bot's own transitions to avoid self-triggered
+                    # join/follow feedback loops.
+                    if member == adapter_self._client.user:
+                        return
 
-                if joined or left or switched:
-                    logger.info(
-                        "Voice state: %s (%d) %s (guild %d)",
-                        member.display_name,
-                        member.id,
-                        "joined " + after.channel.name if joined
-                        else "left " + before.channel.name if left
-                        else f"moved {before.channel.name} -> {after.channel.name}",
-                        guild_id,
+                    new_channel_id = after.channel.id if after.channel is not None else None
+                    adapter_self._update_voice_follow_member(
+                        guild_id, member.id, new_channel_id, guild=guild,
+                    )
+
+                    joined = before.channel is None and after.channel is not None
+                    left = before.channel is not None and after.channel is None
+                    switched = (
+                        before.channel is not None
+                        and after.channel is not None
+                        and before.channel != after.channel
+                    )
+
+                    if joined or left or switched:
+                        logger.info(
+                            "Voice state: %s (%d) %s (guild %d)",
+                            member.display_name,
+                            member.id,
+                            "joined " + after.channel.name if joined
+                            else "left " + before.channel.name if left
+                            else f"moved {before.channel.name} -> {after.channel.name}",
+                            guild_id,
+                        )
+
+                    if not getattr(adapter_self, "_voice_auto_follow", False):
+                        return
+                    # Only act on allowed users. No channel-context bypass: the
+                    # user must be explicitly allowed (ID/role/wildcard/pairing).
+                    try:
+                        if not adapter_self._is_allowed_user(
+                            str(member.id), guild=guild, is_dm=False,
+                        ):
+                            return
+                    except Exception:
+                        logger.debug(
+                            "[%s] auto-follow auth check failed for %d",
+                            adapter_self.name, member.id, exc_info=True,
+                        )
+                        return
+
+                    # An allowed user changed voice state -> coalesce a follow.
+                    adapter_self._schedule_voice_auto_follow(guild_id)
+                except Exception as e:  # pragma: no cover - defensive
+                    logger.warning(
+                        "[%s] on_voice_state_update error: %s",
+                        adapter_self.name, e, exc_info=True,
                     )
 
             # Register slash commands
@@ -2330,6 +2386,14 @@ class DiscordAdapter(BasePlatformAdapter):
                         task.cancel()
         self._pending_text_batch_tasks.clear()
         self._pending_text_batches.clear()
+        # Cancel any in-flight voice auto-follow passes so they cannot fire a
+        # late join/leave after cancellation.
+        for task in list(getattr(self, "_voice_follow_pending", {}).values()):
+            if task and not task.done():
+                task.cancel()
+        self._voice_follow_pending.clear()
+        self._voice_follow_members.clear()
+        self._voice_follow_manual_guilds.clear()
         await super().cancel_background_tasks()
 
     def _text_batch_flush_deadline_seconds(self) -> float:
@@ -4559,6 +4623,25 @@ class DiscordAdapter(BasePlatformAdapter):
             minimum=0,
         )
 
+    def _load_voice_auto_follow(self) -> bool:
+        """Return whether voice auto-follow is enabled.
+
+        Reads ``discord.voice_auto_follow`` from config.yaml; defaults False
+        (opt-in) since auto-joining VC and speaking is a behavior change.
+        """
+        try:
+            from hermes_cli.config import read_raw_config
+            cfg = read_raw_config() or {}
+            raw = (cfg.get("discord") or {}).get(
+                "voice_auto_follow", getattr(self, "VOICE_AUTO_FOLLOW_DEFAULT", False)
+            )
+        except Exception:
+            logger.debug("Could not load discord.voice_auto_follow config", exc_info=True)
+            return bool(getattr(self, "VOICE_AUTO_FOLLOW_DEFAULT", False))
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in {"true", "1", "yes", "on"}
+
     def _load_playback_timeout(self) -> int:
         """Return minimum playback wait seconds for Discord VC audio."""
         return self._load_discord_int_config(
@@ -5027,7 +5110,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _abort_streaming_session_for_guild(self, guild_id: int) -> bool:
         """Abort any active streaming-TTS session in *guild_id* (barge-in)."""
-        hid = self._streaming_tts_by_guild.pop(guild_id, None)
+        hid = getattr(self, "_streaming_tts_by_guild", {}).pop(guild_id, None)
         if hid is None:
             return False
         session = self._streaming_tts_sessions.pop(hid, None)
@@ -5310,6 +5393,172 @@ class DiscordAdapter(BasePlatformAdapter):
     # Voice listening (Phase 2)
     # ------------------------------------------------------------------
 
+    # ------------------------------------------------------------------
+    # Voice auto-follow
+    # ------------------------------------------------------------------
+
+    def _update_voice_follow_member(self, guild_id: int, user_id: int,
+                                    channel_id: Optional[Any], *, guild=None) -> None:
+        """Track an allowed member's voice channel in ``_voice_follow_members``.
+
+        Unauthorized members are dropped from the map so they can neither
+        trigger nor block a follow. This runs on every voice-state update
+        (even with auto-follow off) so a runtime toggle has fresh state.
+        """
+        members = self._voice_follow_members.setdefault(guild_id, {})
+        try:
+            if not self._is_allowed_user(str(user_id), guild=guild, is_dm=False):
+                members.pop(user_id, None)
+                return
+        except Exception:
+            # An auth-check failure must not wedge the map; drop the member
+            # and let the next event re-evaluate.
+            members.pop(user_id, None)
+            return
+        members[user_id] = channel_id
+
+    def set_voice_follow_manual(self, guild_id: int, manual: bool) -> None:
+        """(De)mark a guild as under manual voice control (e.g. /voice leave).
+
+        While manual, the auto-follow task will not auto-join/follow/leave so
+        the operator's explicit choice is never overridden.
+        """
+        if manual:
+            self._voice_follow_manual_guilds.add(guild_id)
+        else:
+            self._voice_follow_manual_guilds.discard(guild_id)
+
+    def _voice_follow_manual(self, guild_id: int) -> bool:
+        return guild_id in getattr(self, "_voice_follow_manual_guilds", set())
+
+    def _schedule_voice_auto_follow(self, guild_id: int) -> None:
+        """Coalesce an auto-follow pass for *guild_id* (latest-wins).
+
+        Rapid back-to-back voice-state updates each cancel the in-flight task
+        and reschedule a fresh one, so only the final state is acted on.
+        """
+        prev = self._voice_follow_pending.get(guild_id)
+        if prev is not None and not prev.done():
+            prev.cancel()
+        task = asyncio.create_task(self._voice_auto_follow_task(guild_id))
+        self._voice_follow_pending[guild_id] = task
+
+    def _resolve_voice_follow_target(self, guild_id: int) -> Optional[Any]:
+        """Return the voice channel to follow for *guild_id*, or None.
+
+        Reads the FRESH ``_voice_follow_members`` state (not the event that
+        scheduled the task) so a coalesced task never acts on stale input.
+        Returns the channel of the most recently seen occupied member. None
+        when every tracked member is out of voice.
+        """
+        members = self._voice_follow_members.get(guild_id, {})
+        # Discard None (not-in-voice) entries and unresolved values.
+        occupied = [(uid, ch) for uid, ch in members.items() if ch is not None]
+        if not occupied:
+            return None
+        # Latest entry (dict order preserved) wins — deterministic and
+        # represents the user who most recently changed voice state.
+        _uid, channel = occupied[-1]
+        return channel
+
+    async def _voice_auto_follow_task(self, guild_id: int) -> None:
+        """Serialize one auto-follow pass for *guild_id* under its voice lock.
+
+        Joins/follows the latest target channel (binding transcript/TTS to the
+        VC's integrated text chat), or gracefully leaves once no allowed user
+        remains. All exceptions are contained here so the discord.py event loop
+        and gateway connectivity are never compromised.
+        """
+        try:
+            if self._voice_follow_manual(guild_id):
+                return
+            async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
+                target = self._resolve_voice_follow_target(guild_id)
+                vc = self._voice_clients.get(guild_id)
+                connected = vc is not None and vc.is_connected()
+
+                if target is None:
+                    await self._maybe_voice_auto_leave(guild_id)
+                    return
+
+                current_ch = vc.channel.id if (connected and vc and vc.channel) else None
+                try:
+                    target_id = target.id
+                except Exception:
+                    logger.debug(
+                        "[%s] auto-follow target has no id (guild %d)",
+                        self.name, guild_id,
+                    )
+                    target_id = None
+
+                if current_ch == target_id:
+                    # Already in the right channel; speaking/activity keeps the
+                    # inactivity timer fresh.
+                    self._reset_voice_timeout(guild_id)
+                    return
+
+                await self.join_voice_channel(
+                    target,
+                    text_channel_id=target_id,
+                    source=self._synthetic_voice_source(guild_id, target_id),
+                )
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:  # pragma: no cover - defensive
+            logger.warning(
+                "[%s] voice auto-follow error (guild %d): %s",
+                self.name, guild_id, e, exc_info=True,
+            )
+        finally:
+            pending = self._voice_follow_pending.get(guild_id)
+            if pending is asyncio.current_task():
+                self._voice_follow_pending.pop(guild_id, None)
+
+    def _synthetic_voice_source(self, guild_id: int, text_channel_id: Any) -> Dict[str, Any]:
+        """Compose source metadata so voice input routes like /voice join.
+
+        ``_handle_voice_channel_input`` (run.py) prefers ``_voice_sources`` and
+        otherwise falls back to a synthetic source, so this is parity metadata,
+        not required for routing.
+        """
+        return {
+            "platform": getattr(self.platform, "value", "discord"),
+            "chat_id": str(text_channel_id) if text_channel_id is not None else None,
+            "user_id": str(self._client.user.id) if self._client and self._client.user else "0",
+            "guild_id": guild_id,
+            "chat_type": "channel",
+        }
+
+    async def _maybe_voice_auto_leave(self, guild_id: int) -> None:
+        """Gracefully leave *guild_id* once no allowed user remains.
+
+        Honours ``voice_auto_follow_leave_delay_seconds``: lingers that long,
+        then re-checks (so a quick re-join is never yanked out) before
+        disconnecting. A delay of 0 defers to the general inactivity timer.
+        """
+        if not self.is_in_voice_channel(guild_id):
+            return
+        delay = int(getattr(self, "_voice_auto_follow_leave_delay", 0) or 0)
+        if delay <= 0:
+            # Fall back to the existing inactivity timer.
+            self._reset_voice_timeout(guild_id)
+            return
+        await asyncio.sleep(delay)
+        if self._voice_follow_manual(guild_id):
+            return
+        # Re-check fresh state: did an allowed user come back meanwhile?
+        if self._resolve_voice_follow_target(guild_id) is not None:
+            return
+        if not self.is_in_voice_channel(guild_id):
+            return
+        await self.leave_voice_channel(guild_id)
+        text_ch_id = self._voice_text_channels.get(guild_id)
+        if text_ch_id is not None and self._on_voice_disconnect:
+            try:
+                self._on_voice_disconnect(str(text_ch_id))
+            except Exception:
+                logger.debug("voice auto-leave disconnect callback failed", exc_info=True)
+
     # UDP keepalive interval in seconds — prevents Discord from dropping
     # the UDP route after ~60s of silence.
     _KEEPALIVE_INTERVAL = 15
@@ -5383,7 +5632,7 @@ class DiscordAdapter(BasePlatformAdapter):
 
     def _playback_active(self, guild_id: int) -> bool:
         """True when any voice audio is currently playing in the guild."""
-        if self._streaming_tts_by_guild.get(guild_id):
+        if getattr(self, "_streaming_tts_by_guild", {}).get(guild_id):
             return True
         mixer = getattr(self, "_voice_mixers", {}).get(guild_id) if getattr(self, "_voice_mixers", None) else None
         if mixer is not None and getattr(mixer, "speech_active", False):
