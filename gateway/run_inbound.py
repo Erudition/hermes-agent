@@ -1622,11 +1622,35 @@ class GatewayInboundMixin:
         session_key = session_key or self._session_key_for_source(source)
         # Reset only this session's per-call buffer; other sessions may be concurrently preparing.
         self._consume_pending_native_image_paths(session_key)
+        self._consume_pending_native_audio_paths(session_key)
 
         message_text = self._prefix_inbound_sender_context(event, source, message_text)
         image_paths, audio_paths, audio_file_paths, video_paths = self._classify_inbound_media(event, _pending_stt_prepared)
         if image_paths:
             message_text = await self._enrich_inbound_images(source, session_key, message_text, image_paths)
+
+        # --- Native audio routing (bypass STT for audio-capable models) ---
+        if audio_paths:
+            logger.warning(
+                "Audio routing: %d voice file(s) detected, checking model audio support...",
+                len(audio_paths),
+            )
+            _audio_native = await asyncio.to_thread(
+                self._model_supports_audio_input,
+                source=source,
+                session_key=session_key,
+            )
+            if _audio_native:
+                self._session_state(
+                    session_key
+                ).persistent.native_audio_paths = list(audio_paths)
+                logger.warning(
+                    "Audio routing: native (model supports audio input). "
+                    "%d voice file(s) will be attached inline, STT bypassed.",
+                    len(audio_paths),
+                )
+                audio_paths = []
+
         if audio_paths:
             message_text = await self._enrich_inbound_voice(event, source, message_text, audio_paths)
         message_text = self._prepend_inbound_media_file_notes(message_text, audio_file_paths, video_paths)
@@ -1663,6 +1687,13 @@ class GatewayInboundMixin:
         paths = list(state.persistent.native_image_paths or []) if state is not None else []
         if paths:
             state.persistent.native_image_paths = []
+        return paths
+
+    def _consume_pending_native_audio_paths(self, session_key: str) -> List[str]:
+        state = self._peek_session_state(session_key)
+        paths = list(state.persistent.native_audio_paths or []) if state is not None else []
+        if paths:
+            state.persistent.native_audio_paths = []
         return paths
 
     async def _mark_durable_active_turn(self, event: "MessageEvent", session_key: str) -> bool:
@@ -1865,6 +1896,69 @@ class GatewayInboundMixin:
             logger.debug("image_routing: decision failed, falling back to text — %s", exc)
             return "text"
 
+    def _model_supports_audio_input(
+        self,
+        *,
+        source: Optional[SessionSource] = None,
+        session_key: Optional[str] = None,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> bool:
+        """Return True if the resolved model for this turn supports native audio input.
+
+        Mirrors _decide_image_input_mode's resolution order: session runtime overrides, then
+        config-level model/provider, then an explicit ``supports_audio_input`` override in
+        config.yaml (agent.image_routing._supports_audio_input_override), then models.dev
+        capabilities."""
+        try:
+            from agent.models_dev import get_model_capabilities
+            from agent.image_routing import _supports_audio_input_override
+            from agent.auxiliary_client import _read_main_model, _read_main_provider
+            from hermes_cli.config import load_config
+
+            cfg = load_config()
+            resolved_provider = (provider or "").strip() if provider else ""
+            resolved_model = (model or "").strip() if model else ""
+
+            # Resolve session runtime (same pattern as _decide_image_input_mode)
+            needs_session_runtime = not resolved_provider or not resolved_model
+            has_session_identity = source is not None or session_key
+            if needs_session_runtime and has_session_identity:
+                try:
+                    turn_model, runtime_kwargs = self._resolve_session_agent_runtime(
+                        source=source,
+                        session_key=session_key,
+                        user_config=cfg,
+                    )
+                    if not resolved_model and isinstance(turn_model, str):
+                        resolved_model = turn_model.strip()
+                    runtime_provider = runtime_kwargs.get("provider") if isinstance(runtime_kwargs, dict) else None
+                    if not resolved_provider and isinstance(runtime_provider, str):
+                        resolved_provider = runtime_provider.strip()
+                except Exception as exc:
+                    logger.debug(
+                        "audio_routing: session runtime resolution failed, falling back to config — %s",
+                        exc,
+                    )
+
+            if not resolved_provider:
+                resolved_provider = _read_main_provider()
+            if not resolved_model:
+                resolved_model = _read_main_model()
+
+            # Check config override first (like the image routing stabilizer)
+            override = _supports_audio_input_override(
+                cfg, resolved_provider, resolved_model,
+            )
+            if override is not None:
+                return override
+
+            caps = get_model_capabilities(resolved_provider, resolved_model)
+            return caps.supports_audio_input() if caps else False
+        except Exception as exc:
+            logger.warning("audio_routing: capability check failed, falling back to STT — %s", exc)
+            return False
+
     async def _enrich_message_with_vision(self, user_text: str, image_paths: List[str]) -> str:
         """Auto-analyze user-attached images with the vision tool and prepend the descriptions.
         Description *and* local cache path are injected so the model understands the image without
@@ -1961,6 +2055,19 @@ class GatewayInboundMixin:
         failed or STT is disabled) let callers echo them back before the agent loop."""
         from gateway.run import _probe_audio_duration
         audio_paths = list(dict.fromkeys(audio_paths))
+        # User force-declared native mode (agent.image_input_mode: native in config.yaml) routes
+        # audio inline without STT. self.config is a GatewayConfig dataclass (no ``agent`` field),
+        # so read the raw user dict the same way _decide_image_input_mode does.
+        _agent_cfg = {}
+        try:
+            from hermes_cli.config import load_config as _hermes_load_config
+            _raw_cfg = _hermes_load_config()
+            if isinstance(_raw_cfg, dict):
+                _agent_cfg = _raw_cfg.get("agent", {})
+        except Exception:
+            _agent_cfg = {}
+        if isinstance(_agent_cfg, dict) and _agent_cfg.get("image_input_mode") == "native":
+            return user_text, []
         if not getattr(self.config, "stt_enabled", True):
             notes = []
             for path in audio_paths:

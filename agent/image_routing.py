@@ -1,171 +1,79 @@
-"""Routing helpers for inbound user-attached images.
 
-``native`` attaches images as OpenAI-style ``image_url`` parts; ``text`` runs
-``vision_analyze`` up-front and prepends the lossy description (right for
-non-vision models). :func:`decide_image_input_mode` picks once per turn from
-``agent.image_input_mode`` (``auto`` | ``native`` | ``text``): in ``auto`` an
-explicit ``auxiliary.vision`` backend forces ``text`` even for vision-capable
-main models (``native`` is the absolute override); else ``supports_vision``
-(config override or catalog) decides. ``vision_analyze`` stays a tool regardless.
-"""
-
-from __future__ import annotations
-
-import base64
-import logging
-import mimetypes
-import os
-import re
-from contextlib import suppress
-from io import BytesIO
-from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
-
-logger = logging.getLogger(__name__)
-
-
-_VALID_MODES = frozenset({"auto", "native", "text"})
-
-
-# Extensions extract_image_refs() auto-attaches. Documents/archives are excluded:
-# the gateway routes them via send_document and a PDF must never become a vision part.
-_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".tiff", ".tif", ".heic")
-_IMAGE_EXT_PATTERN = "|".join(e.lstrip(".") for e in _IMAGE_EXTS)
-# Local path: same shape as gateway extract_local_files() — anchored to ``~/`` or
-# ``/``, lookbehind skips matches inside URLs. URL: strict ``http(s)://`` so
-# ``file://`` and other schemes are not grabbed; optional query string.
-_LOCAL_IMAGE_PATH_RE = re.compile(
-    r"(?<![/:\w.])(?:~/|/)(?:[\w.\-]+/)*[\w.\-]+\.(?:" + _IMAGE_EXT_PATTERN + r")\b", re.IGNORECASE,
-)
-_IMAGE_URL_RE = re.compile(
-    r"https?://[^\s<>\"']+?\.(?:" + _IMAGE_EXT_PATTERN + r")(?:\?[^\s<>\"']*)?", re.IGNORECASE,
-)
-_CODE_SPAN_RES = (re.compile(r"```[^\n]*\n.*?```", re.DOTALL), re.compile(r"`[^`\n]+`"))
-
-
-def _matches_outside_code(pattern: re.Pattern, text: str) -> Iterable[str]:
-    """Yield ``pattern`` matches whose start is not inside a fenced block or inline backticks."""
-    spans = [(m.start(), m.end()) for p in _CODE_SPAN_RES for m in p.finditer(text)]
-    return (m.group(0) for m in pattern.finditer(text) if not any(s <= m.start() < e for s, e in spans))
-
-
-def _existing_file(candidate: str) -> Optional[str]:
-    """Expanded path when it is a regular file; None otherwise (incl. OSError on pathological input)."""
-    expanded = os.path.expanduser(candidate)
-    try:
-        return expanded if os.path.isfile(expanded) else None
-    except OSError:
-        return None
-
-
-def extract_image_refs(text: str) -> Tuple[List[str], List[str]]:
-    """Scan free-form text for image references → ``(local_paths, urls)``, each
-    ordered and deduplicated. Local paths must exist as files; URLs are not
-    validated (the provider fetches them). Code spans are skipped so pasted
-    snippets aren't live attachments (mirrors ``BaseAdapter.extract_local_files``)."""
-    if not isinstance(text, str) or not text:
-        return [], []
-    local_paths = dict.fromkeys(
-        p for p in map(_existing_file, _matches_outside_code(_LOCAL_IMAGE_PATH_RE, text)) if p
-    )
-    # Trailing punctuation is almost certainly prose ("see https://x/a.png.").
-    urls = dict.fromkeys(u.rstrip(".,;:!?)]>") for u in _matches_outside_code(_IMAGE_URL_RE, text))
-    return list(local_paths), list(urls)
-
-
-_BOOL_TOKENS = {
-    **dict.fromkeys(("true", "yes", "on", "1"), True),
-    **dict.fromkeys(("false", "no", "off", "0"), False),
-}
-
-
-def _coerce_capability_bool(raw: Any) -> Optional[bool]:
-    """Strict boolean coercion for capability overrides: real bools, 0/1 and YAML
-    boolean tokens only; anything else is None so the caller falls through to
-    models.dev. ``bool("false")`` is True, so a quoted ``supports_vision: "false"``
-    would otherwise silently enable native routing on a model that can't handle it."""
-    if isinstance(raw, bool):
-        return raw
-    if isinstance(raw, int):
-        return bool(raw) if raw in (0, 1) else None
-    return _BOOL_TOKENS.get(raw.strip().lower()) if isinstance(raw, str) else None
-
-
-def _dict_or_empty(raw: Any) -> Dict[str, Any]:
-    return raw if isinstance(raw, dict) else {}
-
-
-def _clean_str(raw: Any) -> str:
-    return str(raw or "").strip()
-
-
-def _runtime_main(key: str) -> Any:
-    """Context-local credential source or stripped runtime text; "" when unavailable."""
-    try:
-        from agent.auxiliary_client import _runtime_main_value
-
-        value = _runtime_main_value(key)
-        return value if key == "api_key" else _clean_str(value)
-    except Exception:
-        return ""
-
-
-def _model_supports_vision_override(models_cfg: Any, model: str) -> Optional[bool]:
-    """Per-model ``supports_vision`` (or ``vision`` alias) from a ``models`` mapping."""
-    per_model = _dict_or_empty(_dict_or_empty(models_cfg).get(model))
-    return _coerce_capability_bool(per_model.get("supports_vision", per_model.get("vision")))
-
-
-def _custom_provider_entries(cfg: Dict[str, Any], names: Iterable[str]) -> Iterable[Dict[str, Any]]:
-    """Yield legacy ``custom_providers`` entries matching ``names`` (case-insensitive);
-    ``names`` is the outer loop so list order cannot let a persisted default shadow the live route."""
-    entries = _custom_provider_list(cfg)
-    for wanted in (n.strip().lower() for n in names):
-        yield from (e for e in entries if _clean_str(e.get("name")).lower() == wanted)
-
-
-def _custom_provider_list(cfg: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Dict entries of the legacy ``custom_providers`` list (empty when absent/malformed)."""
-    raw = cfg.get("custom_providers")
-    return [e for e in raw if isinstance(e, dict)] if isinstance(raw, list) else []
-
-
-def _supports_vision_override(
+def _supports_audio_input_override(
     cfg: Optional[Dict[str, Any]],
     provider: str,
     model: str,
     *,
     requested_provider: str = "",
 ) -> Optional[bool]:
-    """Resolve user-declared vision capability from config.yaml; None when unset.
+    """Resolve user-declared audio-input capability from config.yaml.
 
-    First hit wins: ``model.supports_vision`` → ``providers.<p>.models.<model>``
-    → legacy ``custom_providers[].models.<model>``. Named custom providers are
-    rewritten to ``provider="custom"`` at runtime while config keeps the user's
-    name under ``model.provider``, so the requested, runtime and config
-    identities are all tried, plus the bare ``<name>`` of any ``custom:<name>``.
+    Resolution order, first hit wins:
+      1. ``model.supports_audio_input`` (top-level shortcut)
+      2. ``providers.<provider>.models.<model>.supports_audio_input``
+      2b. ``custom_providers`` (legacy list form) ``.models.<model>``
+
+    Returns None when no override is set, so the caller falls through to
+    models.dev.
     """
     if not isinstance(cfg, dict):
         return None
-    model_cfg = _dict_or_empty(cfg.get("model"))
-    top = _coerce_capability_bool(model_cfg.get("supports_vision"))
+
+    # 1. Top-level shortcut
+    model_cfg_raw = cfg.get("model")
+    model_cfg: Dict[str, Any] = model_cfg_raw if isinstance(model_cfg_raw, dict) else {}
+    top = _coerce_capability_bool(model_cfg.get("supports_audio_input"))
     if top is not None:
         return top
 
-    candidates: List[str] = []
-    for candidate in filter(None, (requested_provider, provider, _clean_str(model_cfg.get("provider")))):
-        candidates.append(candidate)
-        if candidate.startswith("custom:") and candidate[len("custom:"):]:
-            candidates.append(candidate[len("custom:"):])
-    candidates = list(dict.fromkeys(candidates))
+    # 2. Per-provider, per-model
+    config_provider = str(model_cfg.get("provider") or "").strip()
+    provider_candidates: List[str] = []
+    for candidate in (requested_provider, provider, config_provider):
+        if not candidate:
+            continue
+        provider_candidates.append(candidate)
+        if candidate.startswith("custom:"):
+            stripped_candidate = candidate[len("custom:"):]
+            if stripped_candidate:
+                provider_candidates.append(stripped_candidate)
+    providers_raw = cfg.get("providers")
+    providers_cfg: Dict[str, Any] = providers_raw if isinstance(providers_raw, dict) else {}
+    for p in dict.fromkeys(provider_candidates):
+        entry_raw = providers_cfg.get(p)
+        entry: Dict[str, Any] = entry_raw if isinstance(entry_raw, dict) else {}
+        models_raw = entry.get("models")
+        models_cfg: Dict[str, Any] = models_raw if isinstance(models_raw, dict) else {}
+        per_model_raw = models_cfg.get(model)
+        per_model: Dict[str, Any] = per_model_raw if isinstance(per_model_raw, dict) else {}
+        coerced = _coerce_capability_bool(per_model.get("supports_audio_input"))
+        if coerced is not None:
+            return coerced
 
-    providers_cfg = _dict_or_empty(cfg.get("providers"))
-    model_maps = [_dict_or_empty(providers_cfg.get(p)).get("models") for p in candidates]
-    model_maps += [entry.get("models") for entry in _custom_provider_entries(cfg, candidates)]
-    return next((v for v in (_model_supports_vision_override(m, model) for m in model_maps) if v is not None), None)
+    # 2b. Legacy list-style custom_providers
+    custom_providers = cfg.get("custom_providers")
+    if isinstance(custom_providers, list):
+        for candidate in dict.fromkeys(provider_candidates):
+            candidate_name = candidate.strip().lower()
+            for entry_raw in custom_providers:
+                if not isinstance(entry_raw, dict):
+                    continue
+                entry_name = str(entry_raw.get("name") or "").strip().lower()
+                if entry_name != candidate_name:
+                    continue
+                models_raw = entry_raw.get("models")
+                models_cfg = models_raw if isinstance(models_raw, dict) else {}
+                per_model_raw = models_cfg.get(model)
+                per_model = per_model_raw if isinstance(per_model_raw, dict) else {}
+                coerced = _coerce_capability_bool(per_model.get("supports_audio_input"))
+                if coerced is not None:
+                    return coerced
+
+    return None
 
 
 def _resolve_inference_value(
+
     cfg: Optional[Dict[str, Any]],
     provider: str,
     key: str,
@@ -543,4 +451,78 @@ def build_native_content_parts(
     return [{"type": "text", "text": combined_text}, *image_parts], skipped
 
 
-__all__ = ["decide_image_input_mode", "build_native_content_parts", "extract_image_refs"]
+
+def build_native_audio_parts(
+    user_text: str,
+    audio_paths: List[str],
+) -> Tuple[List[Dict[str, Any]], List[str]]:
+    """Build an OpenAI-style ``content`` list for native audio attachments.
+
+    Similar to ``build_native_content_parts`` but for audio files. Each local
+    file is read, base64-encoded, and wrapped as::
+
+        {"type": "audio_url", "audio_url": {"url": "data:audio/ogg;base64,..."}}
+
+    The ``audio_url`` type is a convention understood by adapters that support
+    native audio input (e.g. Gemini via ``gemini_native_adapter``). Adapters
+    that don't recognise it simply ignore the part.
+
+    Returns (content_parts, skipped). Skipped entries are local paths that
+    couldn't be read or had undetectable MIME types.
+    """
+    import mimetypes as _mimetypes
+
+    skipped: List[str] = []
+    audio_parts: List[Dict[str, Any]] = []
+    attached_paths: List[str] = []
+
+    for raw_path in audio_paths:
+        p = Path(raw_path)
+        if not p.exists() or not p.is_file():
+            skipped.append(str(raw_path))
+            continue
+        try:
+            data = p.read_bytes()
+        except Exception as exc:
+            logger.warning("image_routing: failed to read audio %s — %s", p, exc)
+            skipped.append(str(raw_path))
+            continue
+        mime, _ = _mimetypes.guess_type(str(p))
+        if not mime or not mime.startswith("audio/"):
+            logger.warning(
+                "image_routing: %s has non-audio MIME %s, skipping native attachment",
+                p, mime,
+            )
+            skipped.append(str(raw_path))
+            continue
+        b64 = base64.b64encode(data).decode("ascii")
+        audio_parts.append({
+            "type": "audio_url",
+            "audio_url": {"url": f"data:{mime};base64,{b64}"},
+        })
+        attached_paths.append(str(p))
+
+    text = (user_text or "").strip()
+
+    if attached_paths:
+        base_text = text or "[Audio attached]"
+        hint_lines = [f"[Audio attached at: {p}]" for p in attached_paths]
+        combined_text = f"{base_text}\n\n" + "\n".join(hint_lines)
+        parts: List[Dict[str, Any]] = [{"type": "text", "text": combined_text}]
+        parts.extend(audio_parts)
+        return parts, skipped
+
+    # No audio successfully attached — fall back to plain text-only behaviour.
+    parts = []
+    if text:
+        parts.append({"type": "text", "text": text})
+    return parts, skipped
+
+
+__all__ = [
+    "decide_image_input_mode",
+    "build_native_content_parts",
+    "build_native_audio_parts",
+    "extract_image_refs",
+]
+

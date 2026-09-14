@@ -553,6 +553,11 @@ class GatewayBusySessionMixin:
             elif not _interrupt_text and _media_urls:
                 _interrupt_text = _build_media_placeholder(event)
             running_agent.interrupt(_interrupt_text)
+            # Signal the adapter's interrupt Event so monitor_for_interrupt and streaming TTS abort.
+            if adapter and hasattr(adapter, "_active_sessions"):
+                _active_ev = adapter._active_sessions.get(self._session_key_for_source(event.source))
+                if _active_ev is not None:
+                    _active_ev.set()
         except Exception:
             pass  # don't let interrupt failure block the ack
 

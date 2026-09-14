@@ -3299,6 +3299,8 @@ class GatewayRunner(
     _pending_messages = legacy_dict_property("_pending_messages")
     _pending_native_image_paths_by_session = legacy_dict_property(
         "_pending_native_image_paths_by_session")
+    _pending_native_audio_paths_by_session = legacy_dict_property(
+        "_pending_native_audio_paths_by_session")
     _session_ephemeral_pin = legacy_dict_property("_session_ephemeral_pin")
     _session_vc_last = legacy_dict_property("_session_vc_last")
     _pending_approvals = legacy_dict_property("_pending_approvals")

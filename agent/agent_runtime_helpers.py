@@ -1733,6 +1733,38 @@ def create_openai_client(agent, client_kwargs: dict, *, reason: str, shared: boo
         client = _gemini_native_client(agent, client_kwargs, httpx_verify, reason=reason, shared=shared)
         if client is not None:
             return client
+    # Custom providers flagged ``native_gemini: true`` in config.yaml route through the
+    # Gemini native adapter too (generateContent / streamGenerateContent) even though they
+    # are absent from _GEMINI_NATIVE_PROVIDER_NAMES. ``requested_provider``/``provider`` may
+    # carry a ``custom:`` prefix, which must be stripped before consulting the config.
+    if agent.provider:
+        from agent.gemini_native_adapter import (
+            GeminiNativeClient,
+            is_native_gemini_base_url,
+            is_gemini_native_provider,
+        )
+        _prov = str(getattr(agent, "requested_provider", "") or agent.provider or "").removeprefix("custom:").strip()
+        base_url = str(client_kwargs.get("base_url", "") or "")
+        if _prov and is_gemini_native_provider(_prov) and is_native_gemini_base_url(base_url, provider=_prov):
+            safe_kwargs = {
+                k: v for k, v in client_kwargs.items()
+                if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+            }
+            if "http_client" not in safe_kwargs:
+                keepalive_http = agent._build_keepalive_http_client(
+                    base_url, verify=httpx_verify,
+                )
+                if keepalive_http is not None:
+                    safe_kwargs["http_client"] = keepalive_http
+            client = GeminiNativeClient(**safe_kwargs)
+            _ra().logger.info(
+                "Gemini native client created for custom provider '%s' (%s, shared=%s) %s",
+                _prov,
+                reason,
+                shared,
+                agent._client_log_context(),
+            )
+            return client
     # TCP keepalives so dead provider connections are detected (~60s) instead of hanging in
     # CLOSE-WAIT. Injected into the local copy only, so each client gets its own httpx.Client;
     # pinned by tests/agent/test_create_openai_client_reuse.py and

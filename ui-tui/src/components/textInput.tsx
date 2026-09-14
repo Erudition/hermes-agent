@@ -102,6 +102,34 @@ const fgSeq = (tone?: string): string => {
   return open
 }
 
+/**
+ * The SGR foreground-open sequence for a theme tone, or '' when it has none.
+ *
+ * Goes through Ink's own `colorize` rather than hand-rolling `38;2;r;g;b`.
+ * These bytes are written raw, past Ink — but Ink's `<Text color>` renders
+ * through chalk, which downgrades to the terminal's real depth (Apple Terminal
+ * is 256-color, and takes a bespoke rich-8-bit path). A hand-rolled truecolor
+ * escape is unparseable there, so the glyph falls back to the default fg and
+ * the accent reads GRAY. Sharing the renderer's own function is the only way
+ * the bypass and the Ink path can't drift.
+ *
+ * Handles `ansi256(N)` for free — the shape the palette quantizer rewrites
+ * theme foregrounds to on exactly those limited-palette terminals.
+ */
+const fgSeq = (tone?: string): string => {
+  const value = (tone ?? '').trim()
+
+  if (!value) {
+    return ''
+  }
+
+  // Colorize a sentinel and keep the OPEN half, so the depth decision stays
+  // Ink's rather than being re-derived here.
+  const [open = ''] = colorize('\u0000', value, 'foreground').split('\u0000')
+
+  return open
+}
+
 // Typed-text fast-echo must carry the SAME explicit fg the Ink render uses:
 // the bypass writes raw cells, and a default-fg glyph goes invisible the
 // moment a skin repaints the background to the opposite polarity (a dark

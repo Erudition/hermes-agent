@@ -15,7 +15,7 @@ import time
 from contextlib import suppress
 from difflib import SequenceMatcher
 from types import SimpleNamespace
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from gateway.config import Platform
 from gateway.platforms.base import build_auto_tts_output_path
@@ -235,9 +235,16 @@ class GatewayVoiceMixin:
             profile=getattr(adapter, "_owner_profile", None))
 
     async def _handle_voice_channel_input(
-        self, guild_id: int, user_id: int, transcript: str, *, adapter=None
+        self, guild_id: int, user_id: int,
+        transcript: Optional[str] = None,
+        audio_path: Optional[str] = None,
+        wav_path: Optional[str] = None,
+        *, adapter=None,
     ):
-        """Handle transcribed voice from a voice channel. ``adapter`` captured the audio; under
+        """Handle transcribed voice or native audio from a user in a voice channel.
+
+        Creates a synthetic MessageEvent and processes it through the adapter's full message
+        pipeline (session, typing, agent, TTS reply). ``adapter`` captured the audio; under
         multiplexing each profile's bot dispatches through its own adapter, never the default's."""
         if adapter is None:
             adapter = self.adapters.get(Platform.DISCORD)
@@ -252,17 +259,70 @@ class GatewayVoiceMixin:
         if not self._is_user_authorized_for_source(source):
             logger.debug("Unauthorized voice input from user %d, ignoring", user_id)
             return
-        if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
-            logger.info("Suppressing duplicate voice transcript for guild=%s user=%s: %s",
-                        guild_id, user_id, transcript[:100])
-            return
-        # Echo the transcript into the text channel (after auth, with mention sanitization).
-        with suppress(Exception):
-            channel = adapter._client.get_channel(text_ch_id)
-            if channel:
-                safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone")
-                safe_text = safe_text.replace("@here", "@\u200bhere")
-                await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+
+        # Native audio path: the resolved model accepts audio input, so the clip rides inline
+        # (STT bypassed; the runner buffers it as native_audio_paths). The placeholder message is
+        # edited in place once background transcription finishes.
+        native_audio = audio_path is not None and self._model_supports_audio_input(source=source)
+        if native_audio:
+            clip_path = audio_path or ""
+            sent_msg = None
+            try:
+                from discord import File as _DiscordFile
+                channel = adapter._client.get_channel(text_ch_id)
+                if channel:
+                    if os.path.isfile(clip_path):
+                        sent_msg = await channel.send(
+                            f"**[Voice]** <@{user_id}>: ⏳ transcribing...",
+                            file=_DiscordFile(clip_path, filename=os.path.basename(clip_path)),
+                        )
+                    else:
+                        sent_msg = await channel.send(f"**[Voice]** <@{user_id}>: ⏳ transcribing...")
+            except Exception:
+                sent_msg = None
+            if sent_msg is not None:
+                asyncio.create_task(
+                    self._voice_transcribe_and_edit(wav_path or clip_path, sent_msg, user_id),
+                )
+            text = "[Voice message]"
+            media_urls = [clip_path]
+            media_types = ["audio/ogg"]
+        else:
+            # STT fallback: transcribe here unless the adapter already attached a transcript, then
+            # echo it (after auth, with mention sanitization) and run the normal pipeline.
+            stt_path = wav_path or audio_path
+            if not transcript and stt_path:
+                try:
+                    from tools.transcription_tools import transcribe_audio
+                    res = await asyncio.to_thread(transcribe_audio, stt_path)
+                    if res and isinstance(res, dict) and res.get("success"):
+                        transcript = (res.get("transcript") or "").strip()
+                except Exception as exc:
+                    logger.warning("Fallback STT failed for %s: %s", stt_path, exc)
+            if not transcript:
+                return
+            # Filter hallucinated / nonsensical STT output (the check the adapter used to run
+            # before the native-audio path).
+            try:
+                from tools.voice_mode import is_whisper_hallucination
+                if is_whisper_hallucination(transcript):
+                    logger.info("Voice STT hallucination suppressed for user %d", user_id)
+                    return
+            except Exception:
+                pass
+            if self._is_duplicate_voice_transcript(guild_id, user_id, transcript):
+                logger.info("Suppressing duplicate voice transcript for guild=%s user=%s: %s",
+                            guild_id, user_id, transcript[:100])
+                return
+            with suppress(Exception):
+                channel = adapter._client.get_channel(text_ch_id)
+                if channel:
+                    safe_text = transcript[:2000].replace("@everyone", "@\u200beveryone")
+                    safe_text = safe_text.replace("@here", "@\u200bhere")
+                    await channel.send(f"**[Voice]** <@{user_id}>: {safe_text}")
+            text = transcript
+            media_urls = []
+            media_types = []
         # Bound text channel's channel_prompt: voice input gets the same per-channel context.
         channel_prompt = None
         if callable(resolver := getattr(adapter, "_resolve_channel_prompt", None)):
@@ -272,10 +332,43 @@ class GatewayVoiceMixin:
         # Synthetic MessageEvent for the normal pipeline; the SimpleNamespace raw_message lets
         # _get_guild_id() extract guild_id so _send_voice_reply() plays audio in the voice channel.
         event = MessageEvent(
-            source=source, text=transcript, message_type=MessageType.VOICE,
+            source=source, text=text, message_type=MessageType.VOICE,
             raw_message=SimpleNamespace(guild_id=guild_id, guild=None),
-            channel_prompt=channel_prompt)
+            channel_prompt=channel_prompt,
+            media_urls=media_urls, media_types=media_types)
         await adapter.handle_message(event)
+
+    async def _voice_transcribe_and_edit(self, audio_path: str, message: Any, user_id: int):
+        """Asynchronously transcribe native-audio clips and edit the placeholder message."""
+        try:
+            from tools.transcription_tools import transcribe_audio
+            from tools.voice_mode import is_whisper_hallucination
+
+            def _reniced_transcribe():
+                try:
+                    os.nice(19)
+                except Exception:
+                    pass
+                try:
+                    os.sched_setaffinity(0, {3})
+                except Exception:
+                    pass
+                return transcribe_audio(audio_path)
+
+            res = await asyncio.to_thread(_reniced_transcribe)
+            if res and isinstance(res, dict) and res.get("success"):
+                raw_text = (res.get("transcript") or "").strip()
+                if is_whisper_hallucination(raw_text):
+                    text_to_display = "(transcription failed)"
+                else:
+                    safe_text = raw_text[:2000].replace("@everyone", "@\u200beveryone")
+                    safe_text = safe_text.replace("@here", "@\u200bhere")
+                    text_to_display = safe_text
+            else:
+                text_to_display = "(transcription failed)"
+            await message.edit(content=f"**[Voice]** <@{user_id}>: {text_to_display}")
+        except Exception as exc:
+            logger.warning("Voice transcribe-and-edit failed for user %s: %s", user_id, exc)
 
     def _should_send_voice_reply(
         self, event: MessageEvent, response: str, agent_messages: list, already_sent: bool = False

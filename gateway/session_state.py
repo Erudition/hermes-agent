@@ -58,10 +58,21 @@ class PersistentState:
     """State with its own lifecycle — NOT cleared wholesale by turn or boundary resets
     (approvals/update prompts ARE cleared, individually, by the boundary security funnel)."""
 
-    approvals: Optional[Dict[str, Any]] = None  # {"command": ..., "pattern_key": ...}
-    update_prompt_pending: bool = False  # /update prompt awaiting a reply
-    native_image_paths: List[str] = field(default_factory=list)  # consumed one-shot
-    # Legacy runner-level pending text (flushed on shutdown); not the adapter-level one.
+
+    # Pending exec approval ({"command": ..., "pattern_key": ...}).
+    approvals: Optional[Dict[str, Any]] = None
+    # /update prompt awaiting a user response.
+    update_prompt_pending: bool = False
+    # Image paths staged for native (inline) attachment; consumed one-shot.
+    native_image_paths: List[str] = field(default_factory=list)
+    # Audio paths staged for native (inline) attachment on audio-capable
+    # models (e.g. Gemini); bypasses STT pipeline.  Consumed one-shot.
+    native_audio_paths: List[str] = field(default_factory=list)
+    # Legacy runner-level pending message text (write-mostly; flushed to
+    # disk on shutdown — see #72680).  NOTE: distinct from the adapter-level
+    # ``_pending_messages`` (Dict[str, MessageEvent]) in gateway/base.py,
+    # which is a different store that happens to share the old name.
+
     pending_command_text: Optional[str] = None
     run_generation: int = 0  # monotonic; NEVER reset (stale-run detection depends on it)
     # Consecutive hygiene compression failures (the in-agent ladder is unreachable: hygiene builds
@@ -214,6 +225,7 @@ class TurnLeaseTokenView(_RunnerView):
 
 # One spec per legacy dict attribute.
 LEGACY_FIELD_SPECS: Dict[str, _FieldSpec] = {
+
     "_running_agents": _spec("turn", "agent", None),
     "_running_agents_ts": _spec("turn", "started_ts", float),
     "_active_session_leases": _spec("turn", "lease", None),
@@ -230,8 +242,10 @@ LEGACY_FIELD_SPECS: Dict[str, _FieldSpec] = {
     "_pending_approvals": _spec("persistent", "approvals", None),
     "_update_prompt_pending": _spec("persistent", "update_prompt_pending", bool),
     "_pending_native_image_paths_by_session": _spec("persistent", "native_image_paths", list),
+    "_pending_native_audio_paths_by_session": _spec("persistent", "native_audio_paths", list),
     "_pending_messages": _spec("persistent", "pending_command_text", None),
     "_session_run_generation": _spec("persistent", "run_generation", int),
+
 }
 
 

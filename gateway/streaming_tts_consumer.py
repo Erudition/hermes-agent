@@ -14,6 +14,7 @@ import contextlib
 import logging
 import queue
 import threading
+import time
 from typing import Any, Dict, Optional
 
 from gateway.platforms.base import AudioFormat, StreamingTTSHandle
@@ -46,6 +47,12 @@ class StreamingTTSConsumer:
         self._completed = self._partial = self._aborted = False
         self._finished = self._dropped = self._suppress_whole_file = False
         self._lock, self._strip_markdown = threading.Lock(), None  # stripper lazily imported
+        # Delta-latency diagnostics (RCA: first VC turn after restart silent)
+        self._created_monotonic = time.monotonic()
+        self._first_delta_at = None
+        self._deltas_received = 0
+        self._chars_received = 0
+        self._clauses_enqueued = 0
 
     active = property(lambda self: self._streamer is not None)  # usable streaming provider
     completed = property(lambda self: self._completed)  # streaming audio fully delivered
@@ -58,6 +65,13 @@ class StreamingTTSConsumer:
     def _enqueue_clauses(self, clauses, full_msg: str, *, log_errors: bool) -> None:
         try:
             for clause in clauses:
+                self._clauses_enqueued += 1
+                logger.info(
+                    "stts diag: clause #%d enqueued (%d chars, t=%.3fs, deltas=%d/%d chars)",
+                    self._clauses_enqueued, len(clause),
+                    time.monotonic() - self._created_monotonic,
+                    self._deltas_received, self._chars_received,
+                )
                 self._queue.put_nowait(clause)
         except queue.Full:
             self._dropped = True
@@ -70,6 +84,15 @@ class StreamingTTSConsumer:
         """Receive text, or flush a ``None`` segment boundary without ending audio. Non-blocking."""
         if self._aborted or not self.active or self._finished:
             return
+        if text is not None:
+            self._deltas_received += 1
+            self._chars_received += len(text)
+            if self._first_delta_at is None:
+                self._first_delta_at = time.monotonic()
+                logger.info(
+                    "stts diag: first delta received t=%.3fs after consumer creation (%d chars)",
+                    self._first_delta_at - self._created_monotonic, len(text),
+                )
         clauses = self._chunker.flush() if text is None else self._chunker.feed(text)
         self._enqueue_clauses(clauses, "streaming TTS queue full, dropping clause",
                               log_errors=True)
@@ -82,7 +105,14 @@ class StreamingTTSConsumer:
         self._finished = True
         if self._aborted or not self.active:
             return
-        self._enqueue_clauses(self._chunker.flush(), "streaming TTS queue full while flushing tail",
+        flushed = list(self._chunker.flush())
+        logger.info(
+            "stts diag: finish flush emitted %d clause(s); totals: %d deltas, %d chars, "
+            "%d clauses enqueued (t=%.3fs)",
+            len(flushed), self._deltas_received, self._chars_received,
+            self._clauses_enqueued, time.monotonic() - self._created_monotonic,
+        )
+        self._enqueue_clauses(flushed, "streaming TTS queue full while flushing tail",
                               log_errors=False)
         # The load-bearing _DONE sentinel must never be lost: evict clauses until it fits.
         while not self._put_sentinel(_DONE, mark_dropped=True):

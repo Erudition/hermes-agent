@@ -22,7 +22,7 @@ from contextvars import copy_context
 from gateway.config import Platform
 from gateway.media_repair import repair_explicit_computer_use_media_paths
 from gateway.platforms.base import BasePlatformAdapter, ProcessingOutcome
-from gateway.platforms.event import MessageEvent
+from gateway.platforms.event import MessageEvent, MessageType
 from gateway.session import (
     SessionSource, _session_key_namespace, build_channel_continuity_note,
     build_session_context,
@@ -1325,6 +1325,10 @@ class GatewayTurnMixin:
         RENDER is gated behind gateway.message_timestamps.enabled (default OFF)."""
         from gateway.run import _load_gateway_config, _message_timestamps_enabled
         persist_user_message = None
+        # Native-audio voice messages carry no transcript; keep a placeholder so the persisted
+        # conversation shows the user sent audio rather than an empty row.
+        if getattr(event, "message_type", None) == MessageType.AUDIO and getattr(event, "media_urls", None):
+            persist_user_message = event.text or "[Audio attached]"
         persist_user_timestamp = None
         try:
             from hermes_time import get_timezone as _get_evt_tz
@@ -3005,14 +3009,10 @@ class GatewayTurnMixin:
         the holder None so the whole-file fallback path runs."""
         # Skip when streaming TTS already delivered audio for this turn (#60671).
         # This avoids a cross-scope NameError: the outer interrupt / finalisation paths reference the
-        # consumer via ``streaming_tts_consumer_holder[0]``. Gates: voice input, auto-TTS enabled for this
+        # consumer via ``streaming_tts_consumer_holder[0]``. Gates: auto-TTS enabled for this
         # chat, adapter supports streaming, and a usable streaming TTS provider configured. See #60671.
         _stts_adapter = self._adapter_for_source(source)
-        _is_voice_input = (
-            message_type is not None
-            and str(getattr(message_type, "value", message_type)).lower() == "voice"
-        )
-        if _stts_adapter is None or not _is_voice_input or not _stts_adapter._should_auto_tts_for_chat(source.chat_id):
+        if _stts_adapter is None or not _stts_adapter._should_auto_tts_for_chat(source.chat_id):
             return
         try:
             from gateway.streaming_tts_consumer import StreamingTTSConsumer
@@ -3393,7 +3393,22 @@ class GatewayTurnMixin:
             await _stts.wait_complete(timeout=10.0)
         except Exception as _stts_done_err:
             logger.debug("streaming TTS wait_complete error: %s", _stts_done_err)
+        if not _stts.done and _stts.audible:
+            # Audio already reached the user: keep draining instead of truncating the reply
+            # mid-word. Playback ends no later than the adapter's own drain deadline; barge-in
+            # still cuts it short immediately.
+            try:
+                await _stts.wait_complete(timeout=150.0)
+            except Exception as _stts_drain_err:
+                logger.debug("streaming TTS drain wait error: %s", _stts_drain_err)
         if not _stts.done:
+            # Never-audible streams (or a genuinely stuck drain) are aborted to free the
+            # consumer task. Audible streams retain suppression; silent streams stay eligible
+            # for whole-file fallback.
+            logger.warning(
+                "streaming TTS finalisation timeout (audible=%s), aborting",
+                _stts.audible,
+            )
             _stts.abort("streaming TTS finalisation timeout")
             await _stts.wait_complete(timeout=2.0)
         if _stts.suppress_whole_file and adapter is not None:

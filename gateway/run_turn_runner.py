@@ -1539,22 +1539,37 @@ class TurnRunner:
 
     def _native_image_run_message(self):
         """Wrap the user turn as an OpenAI-style multimodal content list when
-        _prepare_inbound_message_text buffered image paths; consume-and-clear so later turns on the
-        same runner never re-attach stale images. Falls back to plain text when nothing is readable."""
+        _prepare_inbound_message_text buffered native image/audio paths; consume-and-clear so later
+        turns on the same runner never re-attach stale media. Falls back to plain text when nothing
+        is readable."""
         ctx = self._ctx
+        _run_message = ctx.message
         native_imgs = self._runner._consume_pending_native_image_paths(ctx.session_key)
-        if not native_imgs:
-            return ctx.message
-        try:
-            from agent.image_routing import build_native_content_parts
-            parts, skipped = build_native_content_parts(ctx.message, native_imgs)
-            if skipped:
-                logger.warning("Native image attachment: skipped %d unreadable path(s): %s", len(skipped), skipped)
-            if any(p.get("type") == "image_url" for p in parts):
-                return parts
-        except Exception as exc:
-            logger.warning("Native image attachment failed, falling back to text: %s", exc)
-        return ctx.message
+        if native_imgs:
+            try:
+                from agent.image_routing import build_native_content_parts
+                parts, skipped = build_native_content_parts(ctx.message, native_imgs)
+                if skipped:
+                    logger.warning("Native image attachment: skipped %d unreadable path(s): %s", len(skipped), skipped)
+                if any(p.get("type") == "image_url" for p in parts):
+                    _run_message = parts
+            except Exception as exc:
+                logger.warning("Native image attachment failed, falling back to text: %s", exc)
+        native_audios = self._runner._consume_pending_native_audio_paths(ctx.session_key)
+        if native_audios:
+            try:
+                from agent.image_routing import build_native_audio_parts
+                audio_parts, audio_skipped = build_native_audio_parts(ctx.message, native_audios)
+                if audio_skipped:
+                    logger.warning("Native audio attachment: skipped %d unreadable path(s): %s", len(audio_skipped), audio_skipped)
+                if any(p.get("type") == "audio_url" for p in audio_parts):
+                    if isinstance(_run_message, list):
+                        _run_message = _run_message + [p for p in audio_parts if p.get("type") != "text"]
+                    else:
+                        _run_message = audio_parts
+            except Exception as exc:
+                logger.warning("Native audio attachment failed, falling back to text: %s", exc)
+        return _run_message
 
     def _run_conversation_with_approval(self, agent, agent_history, observed_group_context,
                                         persist_user_message_override, persist_user_timestamp_override):

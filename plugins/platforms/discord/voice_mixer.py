@@ -75,6 +75,109 @@ class MixerChild:
         return samples
 
 
+class StreamingSpeechChild:
+    """Incrementally-fed speech child for streaming TTS.
+
+    Unlike :class:`MixerChild` (which owns the whole clip upfront), this child
+    accepts 48 kHz / stereo / s16le PCM chunks as they arrive from the TTS
+    provider and drains them as 20 ms frames.  While the producer is slower
+    than realtime, ``read_frame`` returns a silence frame (underrun) so the
+    mix keeps flowing; once :meth:`end` has been called and the buffer is
+    drained it returns ``None`` (finished).
+
+    Thread model matches the mixer: ``write``/``end``/``abort`` are called
+    from the asyncio loop thread, ``read_frame`` from discord.py's sender
+    thread — all shared state guarded by a lock.
+    """
+
+    __slots__ = (
+        "name", "_lock", "_buf", "_eof", "_aborted",
+        "gain", "fade_frames", "_fade_done",
+    )
+
+    def __init__(self, *, name: str = "tts_stream", gain: float = 1.0,
+                 fade_in_ms: int = 40):
+        self.name = name
+        self._lock = threading.Lock()
+        self._buf = bytearray()
+        self._eof = False
+        self._aborted = False
+        self.gain = float(gain)
+        # Linear fade-in over N frames avoids a click when speech starts.
+        self.fade_frames = max(0, fade_in_ms // FRAME_LENGTH_MS)
+        self._fade_done = 0
+
+    def write(self, pcm48k_stereo: bytes) -> None:
+        """Append converted PCM bytes (producer side)."""
+        if not pcm48k_stereo:
+            return
+        with self._lock:
+            if self._aborted or self._eof:
+                return
+            self._buf += pcm48k_stereo
+
+    def end(self) -> None:
+        """Signal no more writes; the child finishes once the buffer drains."""
+        with self._lock:
+            self._eof = True
+
+    def abort(self) -> None:
+        """Drop buffered audio immediately and finish (barge-in)."""
+        with self._lock:
+            self._aborted = True
+            self._buf.clear()
+            self._eof = True
+
+    @property
+    def finished(self) -> bool:
+        with self._lock:
+            return self._eof and not self._buf
+
+    @property
+    def aborted(self) -> bool:
+        with self._lock:
+            return self._aborted
+
+    def buffered_ms(self) -> float:
+        with self._lock:
+            return len(self._buf) / BYTES_PER_MS
+
+    def read_frame(self) -> "Optional[np.ndarray]":
+        """Return the next 20 ms frame as float32, or None when done.
+
+        Returns a silence frame while buffering (underrun) so callers that
+        must keep producing frames can; only EOF + drained yields None.
+        """
+        if self._aborted:
+            return None
+        with self._lock:
+            chunk: Optional[bytes]
+            if len(self._buf) >= FRAME_SIZE:
+                chunk = bytes(self._buf[:FRAME_SIZE])
+                del self._buf[:FRAME_SIZE]
+            elif self._eof:
+                if self._buf:  # final partial frame — pad, don't click
+                    chunk = bytes(self._buf)
+                    self._buf.clear()
+                    chunk = chunk + b"\x00" * (FRAME_SIZE - len(chunk))
+                else:
+                    return None
+            else:
+                chunk = None  # underrun → silence
+        np = _require_numpy()
+        if chunk is None:
+            samples = np.zeros(SAMPLES_PER_FRAME * CHANNELS, dtype=np.float32)
+        else:
+            samples = np.frombuffer(chunk, dtype=np.int16).astype(np.float32)
+        gain = self.gain
+        if self.fade_frames and self._fade_done < self.fade_frames:
+            self._fade_done += 1
+            gain *= self._fade_done / self.fade_frames
+        if gain != 1.0:
+            samples = samples * gain
+        return samples
+
+
 class VoiceMixer(discord.AudioSource):
     """Continuous ``discord.AudioSource`` mixing N children: :meth:`set_ambient` installs the
     looping idle bed, :meth:`play_speech` layers a one-shot clip over it (ducking the bed).
@@ -88,8 +191,14 @@ class VoiceMixer(discord.AudioSource):
         self._lock = threading.Lock()
         self._ambient: Optional[MixerChild] = None
         self._speech: List[MixerChild] = []
-        self._ambient_gain, self._duck_gain, self._speech_gain = float(ambient_gain), float(duck_gain), float(speech_gain)
-        # When speech ends, ramp the ambient back up over this many frames instead of jumping.
+
+        self._speech_streams: List[StreamingSpeechChild] = []
+        self._ambient_gain = float(ambient_gain)
+        self._duck_gain = float(duck_gain)
+        self._speech_gain = float(speech_gain)
+        # When speech ends, ramp the ambient back up over this many frames
+        # instead of jumping, so the bed swells back smoothly.
+
         self._duck_release_frames = max(1, duck_release_ms // FRAME_LENGTH_MS)
         self._duck_release_left = 0
         self._closed = self._speech_active = False
@@ -118,6 +227,26 @@ class VoiceMixer(discord.AudioSource):
             if self._ambient is not None:
                 self._ambient.gain = self._duck_gain
 
+    def open_speech_stream(self, *, gain: Optional[float] = None,
+                           fade_in_ms: int = 40) -> StreamingSpeechChild:
+        """Open an incrementally-fed speech stream (streaming TTS).
+
+        Ducks the ambient immediately; the duck releases automatically once
+        the returned child finishes draining (or is aborted).  Feed it with
+        :meth:`StreamingSpeechChild.write` and finish with ``end()``.
+        """
+        with self._lock:
+            child = StreamingSpeechChild(
+                gain=self._speech_gain if gain is None else float(gain),
+                fade_in_ms=fade_in_ms,
+            )
+            self._speech_streams.append(child)
+            self._speech_active = True
+            self._duck_release_left = 0
+            if self._ambient is not None:
+                self._ambient.gain = self._duck_gain
+            return child
+
     @property
     def speech_active(self) -> bool:
         with self._lock:
@@ -126,6 +255,12 @@ class VoiceMixer(discord.AudioSource):
     def stop_speech(self) -> None:
         """Drop any in-flight speech immediately and release the duck."""
         with self._lock:
+            for child in self._speech_streams:
+                try:
+                    child.abort()
+                except Exception:
+                    pass
+            self._speech_streams.clear()
             self._speech.clear()
             self._begin_duck_release_locked()
 
@@ -151,8 +286,27 @@ class VoiceMixer(discord.AudioSource):
                     acc = frame if acc is None else acc + frame
                     still_live.append(child)
                 self._speech = still_live
-                if not self._speech and self._speech_active:
-                    self._begin_duck_release_locked()
+
+
+            # Incremental speech streams (streaming TTS): same ducking rules.
+            if self._speech_streams:
+                still_live_streams: List[StreamingSpeechChild] = []
+                for child in self._speech_streams:
+                    frame = child.read_frame()
+                    if frame is None:
+                        continue
+                    acc = frame if acc is None else acc + frame
+                    still_live_streams.append(child)
+                self._speech_streams = still_live_streams
+
+            if (
+                not self._speech
+                and not self._speech_streams
+                and self._speech_active
+            ):
+                self._begin_duck_release_locked()
+
+
             # Ambient bed — ramp gain back up during duck-release.
             if self._ambient is not None:
                 if self._duck_release_left > 0 and not self._speech_active:
@@ -174,6 +328,42 @@ class VoiceMixer(discord.AudioSource):
             self._closed = True
             self._ambient = None
             self._speech.clear()
+            for child in self._speech_streams:
+                try:
+                    child.abort()
+                except Exception:
+                    pass
+            self._speech_streams.clear()
+
+
+
+# ----------------------------------------------------------------------
+# PCM helpers
+# ----------------------------------------------------------------------
+
+def pcm_24k_mono_to_48k_stereo(pcm: bytes) -> bytes:
+    """Convert 24 kHz mono s16le PCM to Discord-native 48 kHz stereo s16le.
+
+    The OpenAI-compatible streaming TTS providers emit 24 kHz mono; Discord
+    wants 48 kHz stereo.  Uses nearest-neighbour 2x upsampling (inaudible for
+    speech) and channel duplication.  Output is 4x the input byte count.
+    """
+    if not pcm:
+        return b""
+    # Streaming chunks can split a 16-bit sample across writes; drop any
+    # trailing odd byte (it belongs to the next chunk's first sample).
+    if len(pcm) % 2:
+        pcm = pcm[:-1]
+        if not pcm:
+            return b""
+    np = _require_numpy()
+    samples = np.frombuffer(pcm, dtype="<i2")
+    up = np.repeat(samples, 2)          # 2x upsample (nearest neighbour)
+    stereo = np.empty(up.size * 2, dtype="<i2")
+    stereo[0::2] = up                   # left
+    stereo[1::2] = up                   # right
+    return stereo.tobytes()
+
 
 
 def decode_to_pcm(path: str, *, timeout: float = 30.0) -> Optional[bytes]:

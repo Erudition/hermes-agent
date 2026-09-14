@@ -1480,6 +1480,15 @@ DEFAULT_CONFIG = {
         # Minimum seconds before force-stopping a VC playback; the adapter probes clip duration and
         # extends this floor so long TTS isn't cut off.
         "voice_playback_timeout_seconds": 120,
+# When True, the bot auto-joins and follows an allowed user into a
+        # Discord voice channel, binding transcript/TTS output to the voice
+        # channel's integrated text chat. Default False (opt-in): this is a
+        # behavior change that auto-connects to VC and speaks.
+        "voice_auto_follow": False,
+        # Seconds the auto-follow lingers after the last allowed user leaves
+        # a voice channel before disconnecting. 0 = fall back to
+        # voice_channel_inactivity_timeout_seconds (the general idle auto-leave).
+        "voice_auto_follow_leave_delay_seconds": 15,
         # Voice-channel software mixer (plugins/platforms/discord/voice_mixer.py): ambient
         # "thinking" bed, verbal acks and TTS OVERLAP (ambient ducked) vs stop-and-swap.
         "voice_fx": {
