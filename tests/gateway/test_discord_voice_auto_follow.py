@@ -8,9 +8,14 @@ leaking out of ``_resolve_voice_follow_target`` crashed with
 user moved channels while auto-follow was enabled.
 
 These tests pin the read-site contract: the resolved target is always a channel
-object (or None), never a bare id.
+object (or None), never a bare id. Further tests pin the lock contract: the
+auto-follow task must NOT hold the guild voice lock when it calls into
+``join_voice_channel`` / ``leave_voice_channel`` — both acquire that lock
+themselves, and ``asyncio.Lock`` is not reentrant, so an outer hold
+self-deadlocks the task silently (follow never happens, no error logged).
 """
 
+import asyncio
 from types import SimpleNamespace
 
 
@@ -92,3 +97,73 @@ def test_resolve_voice_follow_target_no_client_resolves_to_none():
     target = adapter._resolve_voice_follow_target(111)
 
     assert target is None
+
+
+def _make_task_adapter(client):
+    """Adapter primed for _voice_auto_follow_task: one tracked member in VC 555."""
+    adapter = _make_adapter(client)
+    adapter._voice_follow_manual_guilds = set()
+    adapter._voice_clients = {}
+    adapter._voice_locks = {}
+    adapter._voice_follow_pending = {}
+    adapter._voice_text_channels = {}
+    adapter._voice_auto_follow_leave_delay = 0
+    return adapter
+
+
+def _make_lock_stub(adapter, recorder):
+    """Stub join/leave that re-acquires the guild voice lock, exactly as the
+    real join_voice_channel/leave_voice_channel do. Without this re-acquire
+    the test cannot detect the task holding the lock across the call."""
+
+    async def stub(target_or_guild_id, *args, **kwargs):
+        guild_id = (
+            target_or_guild_id.guild.id
+            if hasattr(target_or_guild_id, "guild")
+            else target_or_guild_id
+        )
+        recorder.append("entered")
+        async with adapter._voice_locks.setdefault(guild_id, asyncio.Lock()):
+            recorder.append("acquired")
+
+    return stub
+
+
+def test_auto_follow_task_does_not_hold_voice_lock_when_joining(monkeypatch):
+    """Follow on move must complete: task may not self-deadlock on the lock."""
+    client = _FakeClient({555: _FakeChannel(555, 111)})
+    adapter = _make_task_adapter(client)
+    adapter._voice_follow_members = {111: {222: 555}}
+    monkeypatch.setattr(
+        adapter, "_synthetic_voice_source",
+        lambda guild_id, text_channel_id: {"platform": "discord"},
+    )
+
+    recorder = []
+    monkeypatch.setattr(adapter, "join_voice_channel", _make_lock_stub(adapter, recorder))
+
+    async def _run():
+        await asyncio.wait_for(adapter._voice_auto_follow_task(111), timeout=3)
+
+    asyncio.run(_run())
+
+    assert recorder == ["entered", "acquired"]
+
+
+def test_auto_follow_task_does_not_hold_voice_lock_when_leaving(monkeypatch):
+    """Auto-leave must complete: same no-outer-lock contract, real _maybe_voice_auto_leave."""
+    adapter = _make_task_adapter(None)
+    adapter._voice_follow_members = {111: {}}
+    adapter._voice_auto_follow_leave_delay = 1
+    monkeypatch.setattr(adapter, "is_in_voice_channel", lambda guild_id: True)
+    monkeypatch.setattr(adapter, "_reset_voice_timeout", lambda guild_id: None)
+
+    recorder = []
+    monkeypatch.setattr(adapter, "leave_voice_channel", _make_lock_stub(adapter, recorder))
+
+    async def _run():
+        await asyncio.wait_for(adapter._voice_auto_follow_task(111), timeout=5)
+
+    asyncio.run(_run())
+
+    assert recorder == ["entered", "acquired"]

@@ -4258,46 +4258,50 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         return channel
 
     async def _voice_auto_follow_task(self, guild_id: int) -> None:
-        """Serialize one auto-follow pass for *guild_id* under its voice lock.
+        """Run one auto-follow pass for *guild_id*.
 
         Joins/follows the latest target channel (binding transcript/TTS to the
         VC's integrated text chat), or gracefully leaves once no allowed user
         remains. All exceptions are contained here so the discord.py event loop
         and gateway connectivity are never compromised.
+
+        Deliberately does NOT hold the guild voice lock: join_voice_channel
+        and leave_voice_channel acquire it themselves and asyncio.Lock is not
+        reentrant, so an outer hold self-deadlocks the pass. Single-flight is
+        already guaranteed by _schedule_voice_auto_follow (latest-wins).
         """
         try:
             if self._voice_follow_manual(guild_id):
                 return
-            async with self._voice_locks.setdefault(guild_id, asyncio.Lock()):
-                target = self._resolve_voice_follow_target(guild_id)
-                vc = self._voice_clients.get(guild_id)
-                connected = vc is not None and vc.is_connected()
+            target = self._resolve_voice_follow_target(guild_id)
+            vc = self._voice_clients.get(guild_id)
+            connected = vc is not None and vc.is_connected()
 
-                if target is None:
-                    await self._maybe_voice_auto_leave(guild_id)
-                    return
+            if target is None:
+                await self._maybe_voice_auto_leave(guild_id)
+                return
 
-                current_ch = vc.channel.id if (connected and vc and vc.channel) else None
-                try:
-                    target_id = target.id
-                except Exception:
-                    logger.debug(
-                        "[%s] auto-follow target has no id (guild %d)",
-                        self.name, guild_id,
-                    )
-                    target_id = None
-
-                if current_ch == target_id:
-                    # Already in the right channel; speaking/activity keeps the
-                    # inactivity timer fresh.
-                    self._reset_voice_timeout(guild_id)
-                    return
-
-                await self.join_voice_channel(
-                    target,
-                    text_channel_id=target_id,
-                    source=self._synthetic_voice_source(guild_id, target_id),
+            current_ch = vc.channel.id if (connected and vc and vc.channel) else None
+            try:
+                target_id = target.id
+            except Exception:
+                logger.debug(
+                    "[%s] auto-follow target has no id (guild %d)",
+                    self.name, guild_id,
                 )
+                target_id = None
+
+            if current_ch == target_id:
+                # Already in the right channel; speaking/activity keeps the
+                # inactivity timer fresh.
+                self._reset_voice_timeout(guild_id)
+                return
+
+            await self.join_voice_channel(
+                target,
+                text_channel_id=target_id,
+                source=self._synthetic_voice_source(guild_id, target_id),
+            )
         except asyncio.CancelledError:
             pass
         except Exception as e:  # pragma: no cover - defensive
