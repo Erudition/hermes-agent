@@ -4236,6 +4236,14 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         scheduled the task) so a coalesced task never acts on stale input.
         Returns the channel of the most recently seen occupied member. None
         when every tracked member is out of voice.
+
+        The map stores channel **ids** (ints, from ``after.channel.id`` in
+        ``on_voice_state_update``). Resolve the id back to a live channel
+        object here — the single gate before ``join_voice_channel`` (which
+        reads ``channel.guild``) and the ``target.id`` consumers — so a raw
+        int can never leak into those paths. An unresolvable/channel-gone id
+        resolves to None (the auto-leave path treats that as "nobody to
+        follow"), matching the out-of-voice contract.
         """
         members = self._voice_follow_members.get(guild_id, {})
         # Discard None (not-in-voice) entries and unresolved values.
@@ -4245,6 +4253,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Latest entry (dict order preserved) wins — deterministic and
         # represents the user who most recently changed voice state.
         _uid, channel = occupied[-1]
+        if isinstance(channel, int) and self._client is not None:
+            channel = self._client.get_channel(channel)
         return channel
 
     async def _voice_auto_follow_task(self, guild_id: int) -> None:
