@@ -167,3 +167,134 @@ def test_auto_follow_task_does_not_hold_voice_lock_when_leaving(monkeypatch):
     asyncio.run(_run())
 
     assert recorder == ["entered", "acquired"]
+
+
+# ---------------------------------------------------------------------------
+# Channel moves must rebuild the voice transport, not ``move_to`` it.
+#
+# discord.py's ``VoiceClient.move_to`` re-handshakes the voice websocket but
+# the UDP capture transport dies with the old connection (the socket reader
+# ends up selecting on a closed fd; no RTP is ever delivered again).
+# Observed live: SPEAKING events keep arriving after the move while capture is
+# permanently silent — the bot follows but can never hear again. The follow
+# path must therefore fully disconnect and reconnect, so the fresh-join path
+# reinstalls the receiver on a brand-new transport.
+# ---------------------------------------------------------------------------
+
+
+class _FakeVoiceConnection:
+    def __init__(self):
+        self.secret_key = b"\x01" * 32
+        self.ssrc = 42
+        self.hook = None
+        self.listeners = []
+
+    def add_socket_listener(self, callback):
+        self.listeners.append(callback)
+
+    def remove_socket_listener(self, callback):
+        if callback in self.listeners:
+            self.listeners.remove(callback)
+
+
+class _FakeVoiceClient:
+    def __init__(self, channel_id):
+        self.channel = SimpleNamespace(id=channel_id)
+        self._connection = _FakeVoiceConnection()
+        self.moved_to = None
+        self.disconnected = False
+
+    def is_connected(self):
+        return not self.disconnected
+
+    async def move_to(self, channel):
+        self.moved_to = channel
+
+    async def disconnect(self):
+        self.disconnected = True
+
+
+class _ConnectableChannel(_FakeChannel):
+    def __init__(self, channel_id, guild_id, vc):
+        super().__init__(channel_id, guild_id)
+        self._vc = vc
+
+    async def connect(self):
+        return self._vc
+
+
+def _make_join_adapter(client, existing_vc):
+    adapter = _make_adapter(client)
+    adapter._voice_locks = {}
+    adapter._voice_clients = {111: existing_vc}
+    adapter._voice_receivers = {}
+    adapter._voice_listen_tasks = {}
+    adapter._voice_text_channels = {}
+    adapter._voice_sources = {}
+    adapter._allowed_user_ids = {"222"}
+    return adapter
+
+
+def test_join_voice_channel_reconnects_and_rebuilds_receiver_on_move(monkeypatch):
+    """A follow across channels must reconnect (fresh transport + receiver),
+    not ``move_to`` (which kills UDP capture permanently)."""
+    import plugins.platforms.discord.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "DISCORD_AVAILABLE", True)
+
+    old_vc = _FakeVoiceClient(555)
+    old_receiver = adapter_module.VoiceReceiver(old_vc, allowed_user_ids={"222"})
+    old_receiver.start()
+    old_receiver.map_ssrc(30498, 329095202335621122)
+
+    new_vc = _FakeVoiceClient(777)
+    target = _ConnectableChannel(777, 111, new_vc)
+
+    adapter = _make_join_adapter(_FakeClient(), old_vc)
+    adapter._voice_receivers[111] = old_receiver
+    monkeypatch.setattr(adapter, "_reset_voice_timeout", lambda guild_id: None)
+
+    async def _run():
+        assert await adapter.join_voice_channel(target) is True
+        task = adapter._voice_listen_tasks.get(111)
+        assert task is not None
+        await asyncio.sleep(0)  # let the listen task take its first slice
+        assert not task.done()
+
+    asyncio.run(_run())
+
+    assert old_vc.disconnected is True
+    assert old_vc.moved_to is None
+    assert adapter._voice_clients[111] is new_vc
+
+    new_receiver = adapter._voice_receivers[111]
+    assert new_receiver is not old_receiver
+    assert new_receiver._running is True
+    assert new_receiver._vc is new_vc
+    assert new_vc._connection.listeners == [new_receiver._on_packet]
+    assert new_receiver._ssrc_to_user.get(30498) == 329095202335621122
+
+
+def test_join_voice_channel_same_channel_is_idempotent(monkeypatch):
+    """Already in the target channel: no teardown, no reconnect, receiver kept."""
+    import plugins.platforms.discord.adapter as adapter_module
+
+    monkeypatch.setattr(adapter_module, "DISCORD_AVAILABLE", True)
+
+    vc = _FakeVoiceClient(555)
+    receiver = adapter_module.VoiceReceiver(vc, allowed_user_ids={"222"})
+    receiver.start()
+
+    adapter = _make_join_adapter(_FakeClient(), vc)
+    adapter._voice_receivers[111] = receiver
+    monkeypatch.setattr(adapter, "_reset_voice_timeout", lambda guild_id: None)
+
+    async def _run():
+        assert await adapter.join_voice_channel(_FakeChannel(555, 111)) is True
+
+    asyncio.run(_run())
+
+    assert vc.disconnected is False
+    assert vc.moved_to is None
+    assert adapter._voice_receivers[111] is receiver
+    assert receiver._running is True

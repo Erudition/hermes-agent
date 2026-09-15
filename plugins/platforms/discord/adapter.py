@@ -3705,9 +3705,20 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
                 if existing.channel.id == channel.id:
                     self._reset_voice_timeout(guild_id)
                     return True
-                await existing.move_to(channel)
-                self._reset_voice_timeout(guild_id)
-                return True
+                # A channel ``move_to`` re-handshakes the voice websocket but
+                # the UDP capture transport dies with the old connection (the
+                # socket reader selects on a closed fd; no RTP is ever
+                # delivered again, while SPEAKING events keep flowing).
+                # Disconnect and fall through to a fresh connect so the
+                # receiver is rebuilt on a brand-new transport.
+                # Kept (not popped) in _voice_receivers: the fresh-join path
+                # below inherits its SSRC map, and stop() deliberately
+                # preserves the map for exactly this handoff.
+                prev_receiver = self._voice_receivers.get(guild_id)
+                if prev_receiver is not None:
+                    prev_receiver.stop()
+                await existing.disconnect()
+                self._voice_clients.pop(guild_id, None)
             vc = await channel.connect()
             self._voice_clients[guild_id] = vc
             self._reset_voice_timeout(guild_id)
