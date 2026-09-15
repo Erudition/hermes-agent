@@ -4253,8 +4253,8 @@ class DiscordAdapter(DiscordMediaMixin, BasePlatformAdapter):
         # Latest entry (dict order preserved) wins — deterministic and
         # represents the user who most recently changed voice state.
         _uid, channel = occupied[-1]
-        if isinstance(channel, int) and self._client is not None:
-            channel = self._client.get_channel(channel)
+        if isinstance(channel, int):
+            channel = self._client.get_channel(channel) if self._client is not None else None
         return channel
 
     async def _voice_auto_follow_task(self, guild_id: int) -> None:

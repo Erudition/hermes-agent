@@ -82,3 +82,13 @@ def test_resolve_voice_follow_target_none_when_unresolvable_or_out_of_voice():
     adapter._voice_follow_members = {111: {222: None}}
     assert adapter._resolve_voice_follow_target(111) is None
     assert adapter._resolve_voice_follow_target(999) is None
+
+
+def test_resolve_voice_follow_target_no_client_resolves_to_none():
+    """Stored id with no client -> None, never the raw id (auto-leave path)."""
+    adapter = _make_adapter(None)  # disconnected / pre-connect state
+    adapter._voice_follow_members = {111: {222: 555}}
+
+    target = adapter._resolve_voice_follow_target(111)
+
+    assert target is None
